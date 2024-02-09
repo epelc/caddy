@@ -368,11 +368,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cloneURL(origReq.URL, r.URL)
 
 	// prepare the error log
-	logger := errLog
+	errLog = errLog.With(zap.Duration("duration", duration))
+	errLoggers := []*zap.Logger{errLog}
 	if s.Logs != nil {
-		logger = s.Logs.wrapLogger(logger, r.Host)
+		errLoggers = s.Logs.wrapLogger(errLog, r.Host)
 	}
-	logger = logger.With(zap.Duration("duration", duration))
 
 	// get the values that will be used to log the error
 	errStatus, errMsg, errFields := errLogValues(err)
@@ -386,7 +386,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err2 == nil {
 			// user's error route handled the error response
 			// successfully, so now just log the error
-			logger.Debug(errMsg, errFields...)
+			for _, logger := range errLoggers {
+				logger.Debug(errMsg, errFields...)
+			}
 		} else {
 			// well... this is awkward
 			errFields = append([]zapcore.Field{
@@ -394,7 +396,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				zap.Namespace("first_error"),
 				zap.String("msg", errMsg),
 			}, errFields...)
-			logger.Error("error handling handler error", errFields...)
+			for _, logger := range errLoggers {
+				logger.Error("error handling handler error", errFields...)
+			}
 			if handlerErr, ok := err.(HandlerError); ok {
 				w.WriteHeader(handlerErr.StatusCode)
 			} else {
@@ -402,10 +406,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if errStatus >= 500 {
-			logger.Error(errMsg, errFields...)
-		} else {
-			logger.Debug(errMsg, errFields...)
+		for _, logger := range errLoggers {
+			if errStatus >= 500 {
+				logger.Error(errMsg, errFields...)
+			} else {
+				logger.Debug(errMsg, errFields...)
+			}
 		}
 		w.WriteHeader(errStatus)
 	}
@@ -695,6 +701,10 @@ func (s *Server) shouldLogRequest(r *http.Request) bool {
 		// logging is disabled
 		return false
 	}
+	if _, ok := s.Logs.LoggerMapping[r.Host]; ok {
+		// this host is mapped to a particular logger name
+		return true
+	}
 	if _, ok := s.Logs.LoggerNames[r.Host]; ok {
 		// this host is mapped to a particular logger name
 		return true
@@ -724,16 +734,6 @@ func (s *Server) logRequest(
 	repl.Set("http.response.duration", duration)
 	repl.Set("http.response.duration_ms", duration.Seconds()*1e3) // multiply seconds to preserve decimal (see #4666)
 
-	logger := accLog
-	if s.Logs != nil {
-		logger = s.Logs.wrapLogger(logger, r.Host)
-	}
-
-	log := logger.Info
-	if wrec.Status() >= 400 {
-		log = logger.Error
-	}
-
 	userID, _ := repl.GetString("http.auth.user.id")
 
 	reqBodyLength := 0
@@ -757,7 +757,20 @@ func (s *Server) logRequest(
 		}))
 	fields = append(fields, extra.fields...)
 
-	log("handled request", fields...)
+	loggers := []*zap.Logger{accLog}
+	if s.Logs != nil {
+		loggers = s.Logs.wrapLogger(accLog, r.Host)
+	}
+
+	// wrapping may return multiple loggers, so we log to all of them
+	for _, logger := range loggers {
+		logAtLevel := logger.Info
+		if wrec.Status() >= 400 {
+			logAtLevel = logger.Error
+		}
+
+		logAtLevel("handled request", fields...)
+	}
 }
 
 // protocol returns true if the protocol proto is configured/enabled.
