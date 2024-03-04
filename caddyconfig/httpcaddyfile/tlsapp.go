@@ -416,7 +416,10 @@ func (st ServerType) buildTLSApp(
 		}
 
 		// consolidate automation policies that are the exact same
-		tlsApp.Automation.Policies = consolidateAutomationPolicies(tlsApp.Automation.Policies)
+		tlsApp.Automation.Policies = consolidateAutomationPolicies(
+			tlsApp.Automation.Policies,
+			sliceContains(autoHTTPS, "prefer_wildcard"),
+		)
 
 		// ensure automation policies don't overlap subjects (this should be
 		// an error at provision-time as well, but catch it in the adapt phase
@@ -535,7 +538,7 @@ func newBaseAutomationPolicy(options map[string]any, warnings []caddyconfig.Warn
 
 // consolidateAutomationPolicies combines automation policies that are the same,
 // for a cleaner overall output.
-func consolidateAutomationPolicies(aps []*caddytls.AutomationPolicy) []*caddytls.AutomationPolicy {
+func consolidateAutomationPolicies(aps []*caddytls.AutomationPolicy, preferWildcard bool) []*caddytls.AutomationPolicy {
 	// sort from most specific to least specific; we depend on this ordering
 	sort.SliceStable(aps, func(i, j int) bool {
 		if automationPolicyIsSubset(aps[i], aps[j]) {
@@ -618,6 +621,31 @@ outer:
 					}
 					aps = append(aps[:j], aps[j+1:]...)
 					j--
+				}
+			}
+
+			if preferWildcard {
+				// remove subjects from i if they're covered by a wildcard in j
+				iSubjs := aps[i].SubjectsRaw
+				for iSubj := 0; iSubj < len(iSubjs); iSubj++ {
+					for jSubj := range aps[j].SubjectsRaw {
+						if !strings.HasPrefix(aps[j].SubjectsRaw[jSubj], "*.") {
+							continue
+						}
+						if certmagic.MatchWildcard(aps[i].SubjectsRaw[iSubj], aps[j].SubjectsRaw[jSubj]) {
+							iSubjs = append(iSubjs[:iSubj], iSubjs[iSubj+1:]...)
+							iSubj--
+							break
+						}
+					}
+				}
+				aps[i].SubjectsRaw = iSubjs
+
+				// remove i if it has no subjects left
+				if len(aps[i].SubjectsRaw) == 0 {
+					aps = append(aps[:i], aps[i+1:]...)
+					i--
+					continue outer
 				}
 			}
 		}
