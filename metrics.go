@@ -3,10 +3,11 @@ package caddy
 import (
 	"net/http"
 
-	"github.com/caddyserver/caddy/v2/internal/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/caddyserver/caddy/v2/internal/metrics"
 )
 
 // define and register the metrics used in this package.
@@ -65,4 +66,10 @@ type delegator struct {
 func (d *delegator) WriteHeader(code int) {
 	d.status = code
 	d.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap returns the underlying ResponseWriter, necessary for
+// http.ResponseController to work correctly.
+func (d *delegator) Unwrap() http.ResponseWriter {
+	return d.ResponseWriter
 }

@@ -16,24 +16,27 @@ package fileserver
 
 import (
 	"encoding/json"
-	"flag"
+	"io"
 	"log"
+	"os"
 	"strconv"
 	"time"
 
+	"github.com/caddyserver/certmagic"
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+
+	caddycmd "github.com/caddyserver/caddy/v2/cmd"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
-	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	caddytpl "github.com/caddyserver/caddy/v2/modules/caddyhttp/templates"
-	"github.com/caddyserver/certmagic"
-	"go.uber.org/zap"
 )
 
 func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "file-server",
-		Func:  cmdFileServer,
 		Usage: "[--domain <example.com>] [--root <path>] [--listen <addr>] [--browse] [--access-log]",
 		Short: "Spins up a production-ready file server",
 		Long: `
@@ -49,17 +52,25 @@ using this option.
 
 If --browse is enabled, requests for folders without an index file will
 respond with a file listing.`,
-		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("file-server", flag.ExitOnError)
-			fs.String("domain", "", "Domain name at which to serve the files")
-			fs.String("root", "", "The path to the root of the site")
-			fs.String("listen", "", "The address to which to bind the listener")
-			fs.Bool("browse", false, "Enable directory browsing")
-			fs.Bool("templates", false, "Enable template rendering")
-			fs.Bool("access-log", false, "Enable the access log")
-			fs.Bool("debug", false, "Enable verbose debug logs")
-			return fs
-		}(),
+		CobraFunc: func(cmd *cobra.Command) {
+			cmd.Flags().StringP("domain", "d", "", "Domain name at which to serve the files")
+			cmd.Flags().StringP("root", "r", "", "The path to the root of the site")
+			cmd.Flags().StringP("listen", "l", "", "The address to which to bind the listener")
+			cmd.Flags().BoolP("browse", "b", false, "Enable directory browsing")
+			cmd.Flags().BoolP("templates", "t", false, "Enable template rendering")
+			cmd.Flags().BoolP("access-log", "a", false, "Enable the access log")
+			cmd.Flags().BoolP("debug", "v", false, "Enable verbose debug logs")
+			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdFileServer)
+			cmd.AddCommand(&cobra.Command{
+				Use:     "export-template",
+				Short:   "Exports the default file browser template",
+				Example: "caddy file-server export-template > browse.html",
+				RunE: func(cmd *cobra.Command, args []string) error {
+					_, err := io.WriteString(os.Stdout, BrowseTemplate)
+					return err
+				},
+			})
+		},
 	})
 }
 
@@ -136,7 +147,9 @@ func cmdFileServer(fs caddycmd.Flags) (int, error) {
 	if debug {
 		cfg.Logging = &caddy.Logging{
 			Logs: map[string]*caddy.CustomLog{
-				"default": {Level: zap.DebugLevel.CapitalString()},
+				"default": {
+					BaseLog: caddy.BaseLog{Level: zap.DebugLevel.CapitalString()},
+				},
 			},
 		}
 	}

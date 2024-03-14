@@ -232,7 +232,7 @@ func SanitizedPathJoin(root, reqPath string) string {
 		root = "."
 	}
 
-	path := filepath.Join(root, filepath.Clean("/"+reqPath))
+	path := filepath.Join(root, path.Clean("/"+reqPath))
 
 	// filepath.Join also cleans the path, and cleaning strips
 	// the trailing slash, so we need to re-add it afterwards.
@@ -307,5 +307,7 @@ const (
 const separator = string(filepath.Separator)
 
 // Interface guard
-var _ caddy.ListenerWrapper = (*tlsPlaceholderWrapper)(nil)
-var _ caddyfile.Unmarshaler = (*tlsPlaceholderWrapper)(nil)
+var (
+	_ caddy.ListenerWrapper = (*tlsPlaceholderWrapper)(nil)
+	_ caddyfile.Unmarshaler = (*tlsPlaceholderWrapper)(nil)
+)

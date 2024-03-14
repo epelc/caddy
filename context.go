@@ -336,7 +336,7 @@ func (ctx Context) LoadModuleByID(id string, rawMsg json.RawMessage) (any, error
 
 	// fill in its config only if there is a config to fill in
 	if len(rawMsg) > 0 {
-		err := strictUnmarshalJSON(rawMsg, &val)
+		err := StrictUnmarshalJSON(rawMsg, &val)
 		if err != nil {
 			return nil, fmt.Errorf("decoding module config: %s: %v", modInfo, err)
 		}
@@ -420,6 +420,11 @@ func (ctx Context) loadModuleInline(moduleNameKey, moduleScope string, raw json.
 // called during the Provision/Validate phase to reference a
 // module's own host app (since the parent app module is still
 // in the process of being provisioned, it is not yet ready).
+//
+// We return any type instead of the App type because it is NOT
+// intended for the caller of this method to be the one to start
+// or stop App modules. The caller is expected to assert to the
+// concrete type.
 func (ctx Context) App(name string) (any, error) {
 	if app, ok := ctx.cfg.apps[name]; ok {
 		return app, nil
@@ -436,15 +441,23 @@ func (ctx Context) App(name string) (any, error) {
 	return modVal, nil
 }
 
-// AppIsConfigured returns whether an app named name has been
-// configured. Can be called before calling App() to avoid
-// instantiating an empty app when that's not desirable.
-func (ctx Context) AppIsConfigured(name string) bool {
-	if _, ok := ctx.cfg.apps[name]; ok {
-		return true
+// AppIfConfigured returns an app by its name if it has been
+// configured. Can be called instead of App() to avoid
+// instantiating an empty app when that's not desirable. If
+// the app has not been loaded, nil is returned.
+//
+// We return any type instead of the App type because it is not
+// intended for the caller of this method to be the one to start
+// or stop App modules. The caller is expected to assert to the
+// concrete type.
+func (ctx Context) AppIfConfigured(name string) any {
+	if ctx.cfg == nil {
+		// this can happen if the currently-active context
+		// is being accessed, but no config has successfully
+		// been loaded yet
+		return nil
 	}
-	appRaw := ctx.cfg.AppsRaw[name]
-	return appRaw != nil
+	return ctx.cfg.apps[name]
 }
 
 // Storage returns the configured Caddy storage implementation.
@@ -484,6 +497,9 @@ func (ctx Context) Logger(module ...Module) *zap.Logger {
 	mod := ctx.Module()
 	if len(module) > 0 {
 		mod = module[0]
+	}
+	if mod == nil {
+		return Log()
 	}
 	return ctx.cfg.Logging.Logger(mod)
 }

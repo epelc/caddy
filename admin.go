@@ -46,6 +46,17 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+func init() {
+	// The hard-coded default `DefaultAdminListen` can be overidden
+	// by setting the `CADDY_ADMIN` environment variable.
+	// The environment variable may be used by packagers to change
+	// the default admin address to something more appropriate for
+	// that platform. See #5317 for discussion.
+	if env, exists := os.LookupEnv("CADDY_ADMIN"); exists {
+		DefaultAdminListen = env
+	}
+}
+
 // AdminConfig configures Caddy's API endpoint, which is used
 // to manage Caddy while it is running.
 type AdminConfig struct {
@@ -57,7 +68,14 @@ type AdminConfig struct {
 
 	// The address to which the admin endpoint's listener should
 	// bind itself. Can be any single network address that can be
-	// parsed by Caddy. Accepts placeholders. Default: localhost:2019
+	// parsed by Caddy. Accepts placeholders.
+	// Default: the value of the `CADDY_ADMIN` environment variable,
+	// or `localhost:2019` otherwise.
+	//
+	// Remember: When changing this value through a config reload,
+	// be sure to use the `--address` CLI flag to specify the current
+	// admin address if the currently-running admin endpoint is not
+	// the default address.
 	Listen string `json:"listen,omitempty"`
 
 	// If true, CORS headers will be emitted, and requests to the
@@ -300,7 +318,32 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 				// messages. If the requested URI does not include an Internet host
 				// name for the service being requested, then the Host header field MUST
 				// be given with an empty value."
+				//
+				// UPDATE July 2023: Go broke this by patching a minor security bug in 1.20.6.
+				// Understandable, but frustrating. See:
+				// https://github.com/golang/go/issues/60374
+				// See also the discussion here:
+				// https://github.com/golang/go/issues/61431
+				//
+				// We can no longer conform to RFC 2616 Section 14.26 from either Go or curl
+				// in purity. (Curl allowed no host between 7.40 and 7.50, but now requires a
+				// bogus host; see https://superuser.com/a/925610.) If we disable Host/Origin
+				// security checks, the infosec community assures me that it is secure to do
+				// so, because:
+				// 1) Browsers do not allow access to unix sockets
+				// 2) DNS is irrelevant to unix sockets
+				//
+				// I am not quite ready to trust either of those external factors, so instead
+				// of disabling Host/Origin checks, we now allow specific Host values when
+				// accessing the admin endpoint over unix sockets. I definitely don't trust
+				// DNS (e.g. I don't trust 'localhost' to always resolve to the local host),
+				// and IP shouldn't even be used, but if it is for some reason, I think we can
+				// at least be reasonably assured that 127.0.0.1 and ::1 route to the local
+				// machine, meaning that a hypothetical browser origin would have to be on the
+				// local machine as well.
 				uniqueOrigins[""] = struct{}{}
+				uniqueOrigins["127.0.0.1"] = struct{}{}
+				uniqueOrigins["::1"] = struct{}{}
 			} else {
 				uniqueOrigins[net.JoinHostPort("localhost", addr.port())] = struct{}{}
 				uniqueOrigins[net.JoinHostPort("::1", addr.port())] = struct{}{}
@@ -572,12 +615,13 @@ func replaceRemoteAdminServer(ctx Context, cfg *Config) error {
 }
 
 func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool) *certmagic.Config {
+	var cmCfg *certmagic.Config
 	if ident == nil {
 		// user might not have configured identity; that's OK, we can still make a
 		// certmagic config, although it'll be mostly useless for remote management
 		ident = new(IdentityConfig)
 	}
-	cmCfg := &certmagic.Config{
+	template := certmagic.Config{
 		Storage: DefaultStorage, // do not act as part of a cluster (this is for the server's local identity)
 		Logger:  logger,
 		Issuers: ident.issuers,
@@ -587,9 +631,11 @@ func (ident *IdentityConfig) certmagicConfig(logger *zap.Logger, makeCache bool)
 			GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
 				return cmCfg, nil
 			},
+			Logger: logger.Named("cache"),
 		})
 	}
-	return certmagic.New(identityCertCache, *cmCfg)
+	cmCfg = certmagic.New(identityCertCache, template)
+	return cmCfg
 }
 
 // IdentityCredentials returns this instance's configured, managed identity credentials
@@ -995,9 +1041,9 @@ func handleConfigID(w http.ResponseWriter, r *http.Request) error {
 	id := parts[2]
 
 	// map the ID to the expanded path
-	currentCtxMu.RLock()
+	rawCfgMu.RLock()
 	expanded, ok := rawCfgIndex[id]
-	defer currentCtxMu.RUnlock()
+	rawCfgMu.RUnlock()
 	if !ok {
 		return APIError{
 			HTTPStatus: http.StatusNotFound,
@@ -1150,15 +1196,27 @@ traverseLoop:
 					}
 				case http.MethodPut:
 					if _, ok := v[part]; ok {
-						return fmt.Errorf("[%s] key already exists: %s", path, part)
+						return APIError{
+							HTTPStatus: http.StatusConflict,
+							Err:        fmt.Errorf("[%s] key already exists: %s", path, part),
+						}
 					}
 					v[part] = val
 				case http.MethodPatch:
 					if _, ok := v[part]; !ok {
-						return fmt.Errorf("[%s] key does not exist: %s", path, part)
+						return APIError{
+							HTTPStatus: http.StatusNotFound,
+							Err:        fmt.Errorf("[%s] key does not exist: %s", path, part),
+						}
 					}
 					v[part] = val
 				case http.MethodDelete:
+					if _, ok := v[part]; !ok {
+						return APIError{
+							HTTPStatus: http.StatusNotFound,
+							Err:        fmt.Errorf("[%s] key does not exist: %s", path, part),
+						}
+					}
 					delete(v, part)
 				default:
 					return fmt.Errorf("unrecognized method %s", method)
@@ -1300,7 +1358,7 @@ var (
 // will get deleted before the process gracefully exits.
 func PIDFile(filename string) error {
 	pid := []byte(strconv.Itoa(os.Getpid()) + "\n")
-	err := os.WriteFile(filename, pid, 0600)
+	err := os.WriteFile(filename, pid, 0o600)
 	if err != nil {
 		return err
 	}

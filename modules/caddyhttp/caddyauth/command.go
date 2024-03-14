@@ -18,20 +18,21 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 
-	"github.com/caddyserver/caddy/v2"
-	caddycmd "github.com/caddyserver/caddy/v2/cmd"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
+
+	caddycmd "github.com/caddyserver/caddy/v2/cmd"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 func init() {
 	caddycmd.RegisterCommand(caddycmd.Command{
 		Name:  "hash-password",
-		Func:  cmdHashPassword,
 		Usage: "[--algorithm <name>] [--salt <string>] [--plaintext <password>]",
 		Short: "Hashes a password and writes base64",
 		Long: `
@@ -50,13 +51,12 @@ be provided (scrypt).
 
 Note that scrypt is deprecated. Please use 'bcrypt' instead.
 `,
-		Flags: func() *flag.FlagSet {
-			fs := flag.NewFlagSet("hash-password", flag.ExitOnError)
-			fs.String("algorithm", "bcrypt", "Name of the hash algorithm")
-			fs.String("plaintext", "", "The plaintext password")
-			fs.String("salt", "", "The password salt")
-			return fs
-		}(),
+		CobraFunc: func(cmd *cobra.Command) {
+			cmd.Flags().StringP("plaintext", "p", "", "The plaintext password")
+			cmd.Flags().StringP("salt", "s", "", "The password salt")
+			cmd.Flags().StringP("algorithm", "a", "bcrypt", "Name of the hash algorithm")
+			cmd.RunE = caddycmd.WrapCommandFuncForCobra(cmdHashPassword)
+		},
 	})
 }
 

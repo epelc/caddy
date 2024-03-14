@@ -20,16 +20,19 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"go.uber.org/zap"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 func init() {
@@ -54,16 +57,17 @@ func init() {
 // `{http.request.duration_ms}` | Same as 'duration', but in milliseconds.
 // `{http.request.uuid}` | The request unique identifier
 // `{http.request.header.*}` | Specific request header field
-// `{http.request.host.labels.*}` | Request host labels (0-based from right); e.g. for foo.example.com: 0=com, 1=example, 2=foo
 // `{http.request.host}` | The host part of the request's Host header
+// `{http.request.host.labels.*}` | Request host labels (0-based from right); e.g. for foo.example.com: 0=com, 1=example, 2=foo
 // `{http.request.hostport}` | The host and port from the request's Host header
 // `{http.request.method}` | The request method
 // `{http.request.orig_method}` | The request's original method
+// `{http.request.orig_uri}` | The request's original URI
+// `{http.request.orig_uri.path}` | The request's original path
+// `{http.request.orig_uri.path.*}` | Parts of the original path, split by `/` (0-based from left)
 // `{http.request.orig_uri.path.dir}` | The request's original directory
 // `{http.request.orig_uri.path.file}` | The request's original filename
-// `{http.request.orig_uri.path}` | The request's original path
 // `{http.request.orig_uri.query}` | The request's original query string (without `?`)
-// `{http.request.orig_uri}` | The request's original URI
 // `{http.request.port}` | The port part of the request's Host header
 // `{http.request.proto}` | The protocol of the request
 // `{http.request.remote.host}` | The host (IP) part of the remote client's address
@@ -88,13 +92,13 @@ func init() {
 // `{http.request.tls.client.san.emails.*}` | SAN email addresses (index optional)
 // `{http.request.tls.client.san.ips.*}` | SAN IP addresses (index optional)
 // `{http.request.tls.client.san.uris.*}` | SAN URIs (index optional)
+// `{http.request.uri}` | The full request URI
+// `{http.request.uri.path}` | The path component of the request URI
 // `{http.request.uri.path.*}` | Parts of the path, split by `/` (0-based from left)
 // `{http.request.uri.path.dir}` | The directory, excluding leaf filename
 // `{http.request.uri.path.file}` | The filename of the path, excluding directory
-// `{http.request.uri.path}` | The path component of the request URI
-// `{http.request.uri.query.*}` | Individual query string value
 // `{http.request.uri.query}` | The query string (without `?`)
-// `{http.request.uri}` | The full request URI
+// `{http.request.uri.query.*}` | Individual query string value
 // `{http.response.header.*}` | Specific response header field
 // `{http.vars.*}` | Custom variables in the HTTP handler chain
 // `{http.shutting_down}` | True if the HTTP app is shutting down
@@ -222,6 +226,20 @@ func (app *App) Provision(ctx caddy.Context) error {
 			srv.StrictSNIHost = &trueBool
 		}
 
+		// set up the trusted proxies source
+		for srv.TrustedProxiesRaw != nil {
+			val, err := ctx.LoadModule(srv, "TrustedProxiesRaw")
+			if err != nil {
+				return fmt.Errorf("loading trusted proxies modules: %v", err)
+			}
+			srv.trustedProxies = val.(IPRangeSource)
+		}
+
+		// set the default client IP header to read from
+		if srv.ClientIPHeaders == nil {
+			srv.ClientIPHeaders = []string{"X-Forwarded-For"}
+		}
+
 		// process each listener address
 		for i := range srv.Listen {
 			lnOut, err := repl.ReplaceOrErr(srv.Listen[i], true, true)
@@ -278,9 +296,17 @@ func (app *App) Provision(ctx caddy.Context) error {
 		if srv.Errors != nil {
 			err := srv.Errors.Routes.Provision(ctx)
 			if err != nil {
-				return fmt.Errorf("server %s: setting up server error handling routes: %v", srvName, err)
+				return fmt.Errorf("server %s: setting up error handling routes: %v", srvName, err)
 			}
 			srv.errorHandlerChain = srv.Errors.Routes.Compile(errorEmptyHandler)
+		}
+
+		// provision the named routes (they get compiled at runtime)
+		for name, route := range srv.NamedRoutes {
+			err := route.Provision(ctx, srv.Metrics)
+			if err != nil {
+				return fmt.Errorf("server %s: setting up named route '%s' handlers: %v", name, srvName, err)
+			}
 		}
 
 		// prepare the TLS connection policies
@@ -302,9 +328,15 @@ func (app *App) Provision(ctx caddy.Context) error {
 
 // Validate ensures the app's configuration is valid.
 func (app *App) Validate() error {
+	isGo120 := strings.Contains(runtime.Version(), "go1.20")
+
 	// each server must use distinct listener addresses
 	lnAddrs := make(map[string]string)
 	for srvName, srv := range app.Servers {
+		if isGo120 && srv.EnableFullDuplex {
+			app.logger.Warn("enable_full_duplex is not supported in Go 1.20, use a build made with Go 1.21 or later", zap.String("server", srvName))
+		}
+
 		for _, addr := range srv.Listen {
 			listenAddr, err := caddy.ParseNetworkAddress(addr)
 			if err != nil {
@@ -342,6 +374,14 @@ func (app *App) Start() error {
 			MaxHeaderBytes:    srv.MaxHeaderBytes,
 			Handler:           srv,
 			ErrorLog:          serverLogger,
+			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				return context.WithValue(ctx, ConnCtxKey, c)
+			},
+		}
+		h2server := &http2.Server{
+			NewWriteScheduler: func() http2.WriteScheduler {
+				return http2.NewPriorityWriteScheduler(nil)
+			},
 		}
 
 		// disable HTTP/2, which we enabled by default during provisioning
@@ -363,6 +403,9 @@ func (app *App) Start() error {
 					}
 				}
 			}
+		} else {
+			//nolint:errcheck
+			http2.ConfigureServer(srv.server, h2server)
 		}
 
 		// this TLS config is used by the std lib to choose the actual TLS config for connections
@@ -372,9 +415,6 @@ func (app *App) Start() error {
 
 		// enable H2C if configured
 		if srv.protocol("h2c") {
-			h2server := &http2.Server{
-				IdleTimeout: time.Duration(srv.IdleTimeout),
-			}
 			srv.server.Handler = h2c.NewHandler(srv, h2server)
 		}
 
@@ -439,6 +479,17 @@ func (app *App) Start() error {
 				// finish wrapping listener where we left off before TLS
 				for i := lnWrapperIdx; i < len(srv.listenerWrappers); i++ {
 					ln = srv.listenerWrappers[i].WrapListener(ln)
+				}
+
+				// handle http2 if use tls listener wrapper
+				if useTLS {
+					http2lnWrapper := &http2Listener{
+						Listener: ln,
+						server:   srv.server,
+						h2server: h2server,
+					}
+					srv.h2listeners = append(srv.h2listeners, http2lnWrapper)
+					ln = http2lnWrapper
 				}
 
 				// if binding to port 0, the OS chooses a port for us;
@@ -552,9 +603,24 @@ func (app *App) Stop() error {
 			return
 		}
 
+		// First close h3server then close listeners unlike stdlib for several reasons:
+		// 1, udp has only a single socket, once closed, no more data can be read and
+		// written. In contrast, closing tcp listeners won't affect established connections.
+		// This have something to do with graceful shutdown when upstream implements it.
+		// 2, h3server will only close listeners it's registered (quic listeners). Closing
+		// listener first and these listeners maybe unregistered thus won't be closed. caddy
+		// distinguishes quic-listener and underlying datagram sockets.
+
+		// TODO: CloseGracefully, once implemented upstream (see https://github.com/quic-go/quic-go/issues/2103)
+		if err := server.h3server.Close(); err != nil {
+			app.logger.Error("HTTP/3 server shutdown",
+				zap.Error(err),
+				zap.Strings("addresses", server.Listen))
+		}
+
 		// TODO: we have to manually close our listeners because quic-go won't
 		// close listeners it didn't create along with the server itself...
-		// see https://github.com/lucas-clemente/quic-go/issues/3560
+		// see https://github.com/quic-go/quic-go/issues/3560
 		for _, el := range server.h3listeners {
 			if err := el.Close(); err != nil {
 				app.logger.Error("HTTP/3 listener close",
@@ -562,20 +628,26 @@ func (app *App) Stop() error {
 					zap.String("address", el.LocalAddr().String()))
 			}
 		}
+	}
+	stopH2Listener := func(server *Server) {
+		defer finishedShutdown.Done()
+		startedShutdown.Done()
 
-		// TODO: CloseGracefully, once implemented upstream (see https://github.com/lucas-clemente/quic-go/issues/2103)
-		if err := server.h3server.Close(); err != nil {
-			app.logger.Error("HTTP/3 server shutdown",
-				zap.Error(err),
-				zap.Strings("addresses", server.Listen))
+		for i, s := range server.h2listeners {
+			if err := s.Shutdown(ctx); err != nil {
+				app.logger.Error("http2 listener shutdown",
+					zap.Error(err),
+					zap.Int("index", i))
+			}
 		}
 	}
 
 	for _, server := range app.Servers {
-		startedShutdown.Add(2)
-		finishedShutdown.Add(2)
+		startedShutdown.Add(3)
+		finishedShutdown.Add(3)
 		go stopServer(server)
 		go stopH3Server(server)
+		go stopH2Listener(server)
 	}
 
 	// block until all the goroutines have been run by the scheduler;

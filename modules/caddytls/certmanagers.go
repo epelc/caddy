@@ -9,11 +9,12 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"github.com/tailscale/tscert"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -23,14 +24,6 @@ func init() {
 
 // Tailscale is a module that can get certificates from the local Tailscale process.
 type Tailscale struct {
-	// If true, this module will operate in "best-effort" mode and
-	// ignore "soft" errors; i.e. try Tailscale, and if it doesn't connect
-	// or return a certificate, oh well. Failure to connect to Tailscale
-	// results in a no-op instead of an error. Intended for the use case
-	// where this module is added implicitly for convenience, even if
-	// Tailscale isn't necessarily running.
-	Optional bool `json:"optional,omitempty"`
-
 	logger *zap.Logger
 }
 
@@ -60,16 +53,11 @@ func (ts Tailscale) GetCertificate(ctx context.Context, hello *tls.ClientHelloIn
 
 // canHazCertificate returns true if Tailscale reports it can get a certificate for the given ClientHello.
 func (ts Tailscale) canHazCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (bool, error) {
-	if ts.Optional && !strings.HasSuffix(strings.ToLower(hello.ServerName), tailscaleDomainAliasEnding) {
+	if !strings.HasSuffix(strings.ToLower(hello.ServerName), tailscaleDomainAliasEnding) {
 		return false, nil
 	}
 	status, err := tscert.GetStatus(ctx)
 	if err != nil {
-		if ts.Optional {
-			// ignore error if we don't expect/require it to work anyway, but log it for debugging
-			ts.logger.Debug("error getting tailscale status", zap.Error(err), zap.String("server_name", hello.ServerName))
-			return false, nil
-		}
 		return false, err
 	}
 	for _, domain := range status.CertDomains {

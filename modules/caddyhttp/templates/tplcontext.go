@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -29,15 +30,16 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
-	"github.com/alecthomas/chroma/formatters/html"
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/dustin/go-humanize"
 	"github.com/yuin/goldmark"
-	highlighting "github.com/yuin/goldmark-highlighting"
+	highlighting "github.com/yuin/goldmark-highlighting/v2"
 	"github.com/yuin/goldmark/extension"
 	"github.com/yuin/goldmark/parser"
 	gmhtml "github.com/yuin/goldmark/renderer/html"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 // TemplateContext is the TemplateContext with which HTTP templates are executed.
@@ -73,12 +75,14 @@ func (c *TemplateContext) NewTemplate(tplName string) *template.Template {
 	// add our own library
 	c.tpl.Funcs(template.FuncMap{
 		"include":          c.funcInclude,
+		"readFile":         c.funcReadFile,
 		"import":           c.funcImport,
 		"httpInclude":      c.funcHTTPInclude,
 		"stripHTML":        c.funcStripHTML,
 		"markdown":         c.funcMarkdown,
 		"splitFrontMatter": c.funcSplitFrontMatter,
 		"listFiles":        c.funcListFiles,
+		"fileStat":         c.funcFileStat,
 		"env":              c.funcEnv,
 		"placeholder":      c.funcPlaceholder,
 		"fileExists":       c.funcFileExists,
@@ -100,13 +104,11 @@ func (c TemplateContext) OriginalReq() http.Request {
 // trusted files. If it is not trusted, be sure to use escaping functions
 // in your template.
 func (c TemplateContext) funcInclude(filename string, args ...any) (string, error) {
-
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
 
 	err := c.readFileToBuffer(filename, bodyBuf)
-
 	if err != nil {
 		return "", err
 	}
@@ -114,6 +116,23 @@ func (c TemplateContext) funcInclude(filename string, args ...any) (string, erro
 	c.Args = args
 
 	err = c.executeTemplateInBuffer(filename, bodyBuf)
+	if err != nil {
+		return "", err
+	}
+
+	return bodyBuf.String(), nil
+}
+
+// funcReadFile returns the contents of a filename relative to the site root.
+// Note that included files are NOT escaped, so you should only include
+// trusted files. If it is not trusted, be sure to use escaping functions
+// in your template.
+func (c TemplateContext) funcReadFile(filename string) (string, error) {
+	bodyBuf := bufPool.Get().(*bytes.Buffer)
+	bodyBuf.Reset()
+	defer bufPool.Put(bodyBuf)
+
+	err := c.readFileToBuffer(filename, bodyBuf)
 	if err != nil {
 		return "", err
 	}
@@ -169,6 +188,7 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 		return "", err
 	}
 	virtReq.Host = c.Req.Host
+	virtReq.RemoteAddr = "127.0.0.1:10000" // https://github.com/caddyserver/caddy/issues/5835
 	virtReq.Header = c.Req.Header.Clone()
 	virtReq.Header.Set("Accept-Encoding", "identity") // https://github.com/caddyserver/caddy/issues/4352
 	virtReq.Trailer = c.Req.Trailer.Clone()
@@ -195,7 +215,6 @@ func (c TemplateContext) funcHTTPInclude(uri string) (string, error) {
 // {{ template }} from the standard template library. If the imported file has
 // no {{ define }} blocks, the name of the import will be the path
 func (c *TemplateContext) funcImport(filename string) (string, error) {
-
 	bodyBuf := bufPool.Get().(*bytes.Buffer)
 	bodyBuf.Reset()
 	defer bufPool.Put(bodyBuf)
@@ -313,7 +332,7 @@ func (TemplateContext) funcMarkdown(input any) (string, error) {
 			extension.Footnote,
 			highlighting.NewHighlighting(
 				highlighting.WithFormatOptions(
-					html.WithClasses(true),
+					chromahtml.WithClasses(true),
 				),
 			),
 		),
@@ -393,6 +412,21 @@ func (c TemplateContext) funcFileExists(filename string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// funcFileStat returns Stat of a filename
+func (c TemplateContext) funcFileStat(filename string) (fs.FileInfo, error) {
+	if c.Root == nil {
+		return nil, fmt.Errorf("root file system not specified")
+	}
+
+	file, err := c.Root.Open(path.Clean(filename))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	return file.Stat()
 }
 
 // funcHTTPError returns a structured HTTP handler error. EXPERIMENTAL; SUBJECT TO CHANGE.

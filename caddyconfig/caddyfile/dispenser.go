@@ -101,12 +101,12 @@ func (d *Dispenser) nextOnSameLine() bool {
 		d.cursor++
 		return true
 	}
-	if d.cursor >= len(d.tokens) {
+	if d.cursor >= len(d.tokens)-1 {
 		return false
 	}
-	if d.cursor < len(d.tokens)-1 &&
-		d.tokens[d.cursor].File == d.tokens[d.cursor+1].File &&
-		d.tokens[d.cursor].Line+d.numLineBreaks(d.cursor) == d.tokens[d.cursor+1].Line {
+	curr := d.tokens[d.cursor]
+	next := d.tokens[d.cursor+1]
+	if !isNextOnNewLine(curr, next) {
 		d.cursor++
 		return true
 	}
@@ -122,12 +122,12 @@ func (d *Dispenser) NextLine() bool {
 		d.cursor++
 		return true
 	}
-	if d.cursor >= len(d.tokens) {
+	if d.cursor >= len(d.tokens)-1 {
 		return false
 	}
-	if d.cursor < len(d.tokens)-1 &&
-		(d.tokens[d.cursor].File != d.tokens[d.cursor+1].File ||
-			d.tokens[d.cursor].Line+d.numLineBreaks(d.cursor) < d.tokens[d.cursor+1].Line) {
+	curr := d.tokens[d.cursor]
+	next := d.tokens[d.cursor+1]
+	if isNextOnNewLine(curr, next) {
 		d.cursor++
 		return true
 	}
@@ -203,14 +203,17 @@ func (d *Dispenser) Val() string {
 }
 
 // ValRaw gets the raw text of the current token (including quotes).
+// If the token was a heredoc, then the delimiter is not included,
+// because that is not relevant to any unmarshaling logic at this time.
 // If there is no token loaded, it returns empty string.
 func (d *Dispenser) ValRaw() string {
 	if d.cursor < 0 || d.cursor >= len(d.tokens) {
 		return ""
 	}
 	quote := d.tokens[d.cursor].wasQuoted
-	if quote > 0 {
-		return string(quote) + d.tokens[d.cursor].Text + string(quote) // string literal
+	if quote > 0 && quote != '<' {
+		// string literal
+		return string(quote) + d.tokens[d.cursor].Text + string(quote)
 	}
 	return d.tokens[d.cursor].Text
 }
@@ -388,22 +391,22 @@ func (d *Dispenser) Reset() {
 // an argument.
 func (d *Dispenser) ArgErr() error {
 	if d.Val() == "{" {
-		return d.Err("Unexpected token '{', expecting argument")
+		return d.Err("unexpected token '{', expecting argument")
 	}
-	return d.Errf("Wrong argument count or unexpected line ending after '%s'", d.Val())
+	return d.Errf("wrong argument count or unexpected line ending after '%s'", d.Val())
 }
 
 // SyntaxErr creates a generic syntax error which explains what was
 // found and what was expected.
 func (d *Dispenser) SyntaxErr(expected string) error {
-	msg := fmt.Sprintf("%s:%d - Syntax error: Unexpected token '%s', expecting '%s'", d.File(), d.Line(), d.Val(), expected)
+	msg := fmt.Sprintf("syntax error: unexpected token '%s', expecting '%s', at %s:%d import chain: ['%s']", d.Val(), expected, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
 	return errors.New(msg)
 }
 
 // EOFErr returns an error indicating that the dispenser reached
 // the end of the input when searching for the next token.
 func (d *Dispenser) EOFErr() error {
-	return d.Errf("Unexpected EOF")
+	return d.Errf("unexpected EOF")
 }
 
 // Err generates a custom parse-time error with a message of msg.
@@ -418,7 +421,10 @@ func (d *Dispenser) Errf(format string, args ...any) error {
 
 // WrapErr takes an existing error and adds the Caddyfile file and line number.
 func (d *Dispenser) WrapErr(err error) error {
-	return fmt.Errorf("%s:%d - Error during parsing: %w", d.File(), d.Line(), err)
+	if len(d.Token().imports) > 0 {
+		return fmt.Errorf("%w, at %s:%d import chain ['%s']", err, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
+	}
+	return fmt.Errorf("%w, at %s:%d", err, d.File(), d.Line())
 }
 
 // Delete deletes the current token and returns the updated slice
@@ -438,14 +444,14 @@ func (d *Dispenser) Delete() []Token {
 	return d.tokens
 }
 
-// numLineBreaks counts how many line breaks are in the token
-// value given by the token index tknIdx. It returns 0 if the
-// token does not exist or there are no line breaks.
-func (d *Dispenser) numLineBreaks(tknIdx int) int {
-	if tknIdx < 0 || tknIdx >= len(d.tokens) {
-		return 0
+// DeleteN is the same as Delete, but can delete many tokens at once.
+// If there aren't N tokens available to delete, none are deleted.
+func (d *Dispenser) DeleteN(amount int) []Token {
+	if amount > 0 && d.cursor >= (amount-1) && d.cursor <= len(d.tokens)-1 {
+		d.tokens = append(d.tokens[:d.cursor-(amount-1)], d.tokens[d.cursor+1:]...)
+		d.cursor -= amount
 	}
-	return strings.Count(d.tokens[tknIdx].Text, "\n")
+	return d.tokens
 }
 
 // isNewLine determines whether the current token is on a different
@@ -461,25 +467,7 @@ func (d *Dispenser) isNewLine() bool {
 
 	prev := d.tokens[d.cursor-1]
 	curr := d.tokens[d.cursor]
-
-	// If the previous token is from a different file,
-	// we can assume it's from a different line
-	if prev.File != curr.File {
-		return true
-	}
-
-	// The previous token may contain line breaks if
-	// it was quoted and spanned multiple lines. e.g:
-	//
-	// dir "foo
-	//   bar
-	//   baz"
-	prevLineBreaks := d.numLineBreaks(d.cursor - 1)
-
-	// If the previous token (incl line breaks) ends
-	// on a line earlier than the current token,
-	// then the current token is on a new line
-	return prev.Line+prevLineBreaks < curr.Line
+	return isNextOnNewLine(prev, curr)
 }
 
 // isNextOnNewLine determines whether the current token is on a different
@@ -495,23 +483,5 @@ func (d *Dispenser) isNextOnNewLine() bool {
 
 	curr := d.tokens[d.cursor]
 	next := d.tokens[d.cursor+1]
-
-	// If the next token is from a different file,
-	// we can assume it's from a different line
-	if curr.File != next.File {
-		return true
-	}
-
-	// The current token may contain line breaks if
-	// it was quoted and spanned multiple lines. e.g:
-	//
-	// dir "foo
-	//   bar
-	//   baz"
-	currLineBreaks := d.numLineBreaks(d.cursor)
-
-	// If the current token (incl line breaks) ends
-	// on a line earlier than the next token,
-	// then the next token is on a new line
-	return curr.Line+currLineBreaks < next.Line
+	return isNextOnNewLine(curr, next)
 }

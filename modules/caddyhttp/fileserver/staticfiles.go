@@ -26,19 +26,18 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/encode"
-	"go.uber.org/zap"
 )
 
 func init() {
-	weakrand.Seed(time.Now().UnixNano())
-
 	caddy.RegisterModule(FileServer{})
 }
 
@@ -61,7 +60,23 @@ func init() {
 // requested directory does not have an index file, Caddy writes a
 // 404 response. Alternatively, file browsing can be enabled with
 // the "browse" parameter which shows a list of files when directories
-// are requested if no index file is present.
+// are requested if no index file is present. If "browse" is enabled,
+// Caddy may serve a JSON array of the dirctory listing when the `Accept`
+// header mentions `application/json` with the following structure:
+//
+//	[{
+//		"name": "",
+//		"size": 0,
+//		"url": "",
+//		"mod_time": "",
+//		"mode": 0,
+//		"is_dir": false,
+//		"is_symlink": false
+//	}]
+//
+// with the `url` being relative to the request path and `mod_time` in the RFC 3339 format
+// with sub-second precision. For any other value for the `Accept` header, the
+// respective browse template is executed with `Content-Type: text/html`.
 //
 // By default, this handler will canonicalize URIs so that requests to
 // directories end with a slash, but requests to regular files do not.
@@ -232,11 +247,25 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
+	if runtime.GOOS == "windows" {
+		// reject paths with Alternate Data Streams (ADS)
+		if strings.Contains(r.URL.Path, ":") {
+			return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("illegal ADS path"))
+		}
+		// reject paths with "8.3" short names
+		trimmedPath := strings.TrimRight(r.URL.Path, ". ") // Windows ignores trailing dots and spaces, sigh
+		if len(path.Base(trimmedPath)) <= 12 && strings.Contains(trimmedPath, "~") {
+			return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("illegal short name"))
+		}
+		// both of those could bypass file hiding or possibly leak information even if the file is not hidden
+	}
+
 	filesToHide := fsrv.transformHidePaths(repl)
 
 	root := repl.ReplaceAll(fsrv.Root, ".")
 
-	filename := caddyhttp.SanitizedPathJoin(root, r.URL.Path)
+	// remove any trailing `/` as it breaks fs.ValidPath() in the stdlib
+	filename := strings.TrimSuffix(caddyhttp.SanitizedPathJoin(root, r.URL.Path), "/")
 
 	fsrv.logger.Debug("sanitized path join",
 		zap.String("site_root", root),
@@ -341,7 +370,9 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	var file fs.File
-	var etag string
+
+	// etag is usually unset, but if the user knows what they're doing, let them override it
+	etag := w.Header().Get("Etag")
 
 	// check for precompressed files
 	for _, ae := range encode.AcceptedEncodings(r, fsrv.PrecompressedOrder) {
@@ -373,7 +404,9 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		// don't assign info = compressedInfo because sidecars are kind
 		// of transparent; however we do need to set the Etag:
 		// https://caddy.community/t/gzipped-sidecar-file-wrong-same-etag/16793
-		etag = calculateEtag(compressedInfo)
+		if etag == "" {
+			etag = calculateEtag(compressedInfo)
+		}
 
 		break
 	}
@@ -393,12 +426,29 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 		defer file.Close()
 
-		etag = calculateEtag(info)
+		if etag == "" {
+			etag = calculateEtag(info)
+		}
+	}
+
+	// at this point, we're serving a file; Go std lib supports only
+	// GET and HEAD, which is sensible for a static file server - reject
+	// any other methods (see issue #5166)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		// if we're in an error context, then it doesn't make sense
+		// to repeat the error; just continue because we're probably
+		// trying to write an error page response (see issue #5703)
+		if _, ok := r.Context().Value(caddyhttp.ErrorCtxKey).(error); !ok {
+			w.Header().Add("Allow", "GET, HEAD")
+			return caddyhttp.Error(http.StatusMethodNotAllowed, nil)
+		}
 	}
 
 	// set the Etag - note that a conditional If-None-Match request is handled
 	// by http.ServeContent below, which checks against this Etag value
-	w.Header().Set("Etag", etag)
+	if etag != "" {
+		w.Header().Set("Etag", etag)
+	}
 
 	if w.Header().Get("Content-Type") == "" {
 		mtyp := mime.TypeByExtension(filepath.Ext(filename))
@@ -585,7 +635,11 @@ func (fsrv *FileServer) notFound(w http.ResponseWriter, r *http.Request, next ca
 // Prefix the etag with "W/" to convert it into a weak etag.
 // See: https://tools.ietf.org/html/rfc7232#section-2.3
 func calculateEtag(d os.FileInfo) string {
-	t := strconv.FormatInt(d.ModTime().Unix(), 36)
+	mtime := d.ModTime().Unix()
+	if mtime == 0 || mtime == 1 {
+		return "" // not useful anyway; see issue #5548
+	}
+	t := strconv.FormatInt(mtime, 36)
 	s := strconv.FormatInt(d.Size(), 36)
 	return `"` + t + s + `"`
 }
@@ -611,6 +665,12 @@ type statusOverrideResponseWriter struct {
 // to instead write the HTTP status code we want.
 func (wr statusOverrideResponseWriter) WriteHeader(int) {
 	wr.ResponseWriter.WriteHeader(wr.code)
+}
+
+// Unwrap returns the underlying ResponseWriter, necessary for
+// http.ResponseController to work correctly.
+func (wr statusOverrideResponseWriter) Unwrap() http.ResponseWriter {
+	return wr.ResponseWriter
 }
 
 // osFS is a simple fs.FS implementation that uses the local

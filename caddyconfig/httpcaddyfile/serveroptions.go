@@ -18,11 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/dustin/go-humanize"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/dustin/go-humanize"
 )
 
 // serverOptions collects server config overrides parsed from Caddyfile global options
@@ -33,6 +34,7 @@ type serverOptions struct {
 	ListenerAddress string
 
 	// These will all map 1:1 to the caddyhttp.Server struct
+	Name                 string
 	ListenerWrappersRaw  []json.RawMessage
 	ReadTimeout          caddy.Duration
 	ReadHeaderTimeout    caddy.Duration
@@ -40,8 +42,11 @@ type serverOptions struct {
 	IdleTimeout          caddy.Duration
 	KeepAliveInterval    caddy.Duration
 	MaxHeaderBytes       int
+	EnableFullDuplex     bool
 	Protocols            []string
 	StrictSNIHost        *bool
+	TrustedProxiesRaw    json.RawMessage
+	ClientIPHeaders      []string
 	ShouldLogCredentials bool
 	Metrics              *caddyhttp.Metrics
 }
@@ -57,6 +62,15 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 		}
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
+			case "name":
+				if serverOpts.ListenerAddress == "" {
+					return nil, d.Errf("cannot set a name for a server without a listener address")
+				}
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				serverOpts.Name = d.Val()
+
 			case "listener_wrappers":
 				for nesting := d.Nesting(); d.NextBlock(nesting); {
 					modID := "caddy.listeners." + d.Val()
@@ -145,6 +159,12 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 				}
 				serverOpts.MaxHeaderBytes = int(size)
 
+			case "enable_full_duplex":
+				if d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				serverOpts.EnableFullDuplex = true
+
 			case "log_credentials":
 				if d.NextArg() {
 					return nil, d.ArgErr()
@@ -175,6 +195,39 @@ func unmarshalCaddyfileServerOptions(d *caddyfile.Dispenser) (any, error) {
 					boolVal = false
 				}
 				serverOpts.StrictSNIHost = &boolVal
+
+			case "trusted_proxies":
+				if !d.NextArg() {
+					return nil, d.Err("trusted_proxies expects an IP range source module name as its first argument")
+				}
+				modID := "http.ip_sources." + d.Val()
+				unm, err := caddyfile.UnmarshalModule(d, modID)
+				if err != nil {
+					return nil, err
+				}
+				source, ok := unm.(caddyhttp.IPRangeSource)
+				if !ok {
+					return nil, fmt.Errorf("module %s (%T) is not an IP range source", modID, unm)
+				}
+				jsonSource := caddyconfig.JSONModuleObject(
+					source,
+					"source",
+					source.(caddy.Module).CaddyModule().ID.Name(),
+					nil,
+				)
+				serverOpts.TrustedProxiesRaw = jsonSource
+
+			case "client_ip_headers":
+				headers := d.RemainingArgs()
+				for _, header := range headers {
+					if sliceContains(serverOpts.ClientIPHeaders, header) {
+						return nil, d.Errf("client IP header %s specified more than once", header)
+					}
+					serverOpts.ClientIPHeaders = append(serverOpts.ClientIPHeaders, header)
+				}
+				if nesting := d.Nesting(); d.NextBlock(nesting) {
+					return nil, d.ArgErr()
+				}
 
 			case "metrics":
 				if d.NextArg() {
@@ -238,7 +291,22 @@ func applyServerOptions(
 		return nil
 	}
 
-	for _, server := range servers {
+	// check for duplicate names, which would clobber the config
+	existingNames := map[string]bool{}
+	for _, opts := range serverOpts {
+		if opts.Name == "" {
+			continue
+		}
+		if existingNames[opts.Name] {
+			return fmt.Errorf("cannot use duplicate server name '%s'", opts.Name)
+		}
+		existingNames[opts.Name] = true
+	}
+
+	// collect the server name overrides
+	nameReplacements := map[string]string{}
+
+	for key, server := range servers {
 		// find the options that apply to this server
 		opts := func() *serverOptions {
 			for _, entry := range serverOpts {
@@ -267,8 +335,11 @@ func applyServerOptions(
 		server.IdleTimeout = opts.IdleTimeout
 		server.KeepAliveInterval = opts.KeepAliveInterval
 		server.MaxHeaderBytes = opts.MaxHeaderBytes
+		server.EnableFullDuplex = opts.EnableFullDuplex
 		server.Protocols = opts.Protocols
 		server.StrictSNIHost = opts.StrictSNIHost
+		server.TrustedProxiesRaw = opts.TrustedProxiesRaw
+		server.ClientIPHeaders = opts.ClientIPHeaders
 		server.Metrics = opts.Metrics
 		if opts.ShouldLogCredentials {
 			if server.Logs == nil {
@@ -276,6 +347,16 @@ func applyServerOptions(
 			}
 			server.Logs.ShouldLogCredentials = opts.ShouldLogCredentials
 		}
+
+		if opts.Name != "" {
+			nameReplacements[key] = opts.Name
+		}
+	}
+
+	// rename the servers if marked to do so
+	for old, new := range nameReplacements {
+		servers[new] = servers[old]
+		delete(servers, old)
 	}
 
 	return nil

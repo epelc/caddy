@@ -18,10 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"go.uber.org/zap"
+	"golang.org/x/exp/slices"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -29,7 +31,6 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -48,12 +49,13 @@ type App struct {
 }
 
 // ServerType can set up a config from an HTTP Caddyfile.
-type ServerType struct {
-}
+type ServerType struct{}
 
 // Setup makes a config from the tokens.
-func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
-	options map[string]any) (*caddy.Config, []caddyconfig.Warning, error) {
+func (st ServerType) Setup(
+	inputServerBlocks []caddyfile.ServerBlock,
+	options map[string]any,
+) (*caddy.Config, []caddyconfig.Warning, error) {
 	var warnings []caddyconfig.Warning
 	gc := counter{new(int)}
 	state := make(map[string]any)
@@ -79,41 +81,18 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		return nil, warnings, err
 	}
 
-	// replace shorthand placeholders (which are convenient
-	// when writing a Caddyfile) with their actual placeholder
-	// identifiers or variable names
-	replacer := strings.NewReplacer(placeholderShorthands()...)
+	// this will replace both static and user-defined placeholder shorthands
+	// with actual identifiers used by Caddy
+	replacer := NewShorthandReplacer()
 
-	// these are placeholders that allow a user-defined final
-	// parameters, but we still want to provide a shorthand
-	// for those, so we use a regexp to replace
-	regexpReplacements := []struct {
-		search  *regexp.Regexp
-		replace string
-	}{
-		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
-		{regexp.MustCompile(`{cookie\.([\w-]*)}`), "{http.request.cookie.$1}"},
-		{regexp.MustCompile(`{labels\.([\w-]*)}`), "{http.request.host.labels.$1}"},
-		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
-		{regexp.MustCompile(`{file\.([\w-]*)}`), "{http.request.uri.path.file.$1}"},
-		{regexp.MustCompile(`{query\.([\w-]*)}`), "{http.request.uri.query.$1}"},
-		{regexp.MustCompile(`{re\.([\w-]*)\.([\w-]*)}`), "{http.regexp.$1.$2}"},
-		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
-		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
-		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
-		{regexp.MustCompile(`{file_match\.([\w-]*)}`), "{http.matchers.file.$1}"},
+	originalServerBlocks, err = st.extractNamedRoutes(originalServerBlocks, options, &warnings, replacer)
+	if err != nil {
+		return nil, warnings, err
 	}
 
 	for _, sb := range originalServerBlocks {
-		for _, segment := range sb.block.Segments {
-			for i := 0; i < len(segment); i++ {
-				// simple string replacements
-				segment[i].Text = replacer.Replace(segment[i].Text)
-				// complex regexp replacements
-				for _, r := range regexpReplacements {
-					segment[i].Text = r.search.ReplaceAllString(segment[i].Text, r.replace)
-				}
-			}
+		for i := range sb.block.Segments {
+			replacer.ApplyToSegment(&sb.block.Segments[i])
 		}
 
 		if len(sb.block.Keys) == 0 {
@@ -172,6 +151,18 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 				result.directive = dir
 				sb.pile[result.Class] = append(sb.pile[result.Class], result)
 			}
+
+			// specially handle named routes that were pulled out from
+			// the invoke directive, which could be nested anywhere within
+			// some subroutes in this directive; we add them to the pile
+			// for this server block
+			if state[namedRouteKey] != nil {
+				for name := range state[namedRouteKey].(map[string]struct{}) {
+					result := ConfigValue{Class: namedRouteKey, Value: name}
+					sb.pile[result.Class] = append(sb.pile[result.Class], result)
+				}
+				state[namedRouteKey] = nil
+			}
 		}
 	}
 
@@ -222,7 +213,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		if ncl.name == caddy.DefaultLoggerName {
 			hasDefaultLog = true
 		}
-		if _, ok := options["debug"]; ok && ncl.log.Level == "" {
+		if _, ok := options["debug"]; ok && ncl.log != nil && ncl.log.Level == "" {
 			ncl.log.Level = zap.DebugLevel.CapitalString()
 		}
 		customLogs = append(customLogs, ncl)
@@ -241,7 +232,9 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		if _, ok := options["debug"]; ok {
 			customLogs = append(customLogs, namedCustomLog{
 				name: caddy.DefaultLoggerName,
-				log:  &caddy.CustomLog{Level: zap.DebugLevel.CapitalString()},
+				log: &caddy.CustomLog{
+					BaseLog: caddy.BaseLog{Level: zap.DebugLevel.CapitalString()},
+				},
 			})
 		}
 	}
@@ -286,13 +279,38 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 	if adminConfig, ok := options["admin"].(*caddy.AdminConfig); ok && adminConfig != nil {
 		cfg.Admin = adminConfig
 	}
+
+	if pc, ok := options["persist_config"].(string); ok && pc == "off" {
+		if cfg.Admin == nil {
+			cfg.Admin = new(caddy.AdminConfig)
+		}
+		if cfg.Admin.Config == nil {
+			cfg.Admin.Config = new(caddy.ConfigSettings)
+		}
+		cfg.Admin.Config.Persist = new(bool)
+	}
+
 	if len(customLogs) > 0 {
 		if cfg.Logging == nil {
 			cfg.Logging = &caddy.Logging{
 				Logs: make(map[string]*caddy.CustomLog),
 			}
 		}
+
+		// Add the default log first if defined, so that it doesn't
+		// accidentally get re-created below due to the Exclude logic
 		for _, ncl := range customLogs {
+			if ncl.name == caddy.DefaultLoggerName && ncl.log != nil {
+				cfg.Logging.Logs[caddy.DefaultLoggerName] = ncl.log
+				break
+			}
+		}
+
+		// Add the rest of the custom logs
+		for _, ncl := range customLogs {
+			if ncl.log == nil || ncl.name == caddy.DefaultLoggerName {
+				continue
+			}
 			if ncl.name != "" {
 				cfg.Logging.Logs[ncl.name] = ncl.log
 			}
@@ -306,7 +324,15 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 					cfg.Logging.Logs[caddy.DefaultLoggerName] = defaultLog
 				}
 				defaultLog.Exclude = append(defaultLog.Exclude, ncl.log.Include...)
+
+				// avoid duplicates by sorting + compacting
+				sort.Strings(defaultLog.Exclude)
+				defaultLog.Exclude = slices.Compact[[]string, string](defaultLog.Exclude)
 			}
+		}
+		// we may have not actually added anything, so remove if empty
+		if len(cfg.Logging.Logs) == 0 {
+			cfg.Logging = nil
 		}
 	}
 
@@ -390,6 +416,81 @@ func (ServerType) evaluateGlobalOptionsBlock(serverBlocks []serverBlock, options
 	return serverBlocks[1:], nil
 }
 
+// extractNamedRoutes pulls out any named route server blocks
+// so they don't get parsed as sites, and stores them in options
+// for later.
+func (ServerType) extractNamedRoutes(
+	serverBlocks []serverBlock,
+	options map[string]any,
+	warnings *[]caddyconfig.Warning,
+	replacer ShorthandReplacer,
+) ([]serverBlock, error) {
+	namedRoutes := map[string]*caddyhttp.Route{}
+
+	gc := counter{new(int)}
+	state := make(map[string]any)
+
+	// copy the server blocks so we can
+	// splice out the named route ones
+	filtered := append([]serverBlock{}, serverBlocks...)
+	index := -1
+
+	for _, sb := range serverBlocks {
+		index++
+		if !sb.block.IsNamedRoute {
+			continue
+		}
+
+		// splice out this block, because we know it's not a real server
+		filtered = append(filtered[:index], filtered[index+1:]...)
+		index--
+
+		if len(sb.block.Segments) == 0 {
+			continue
+		}
+
+		wholeSegment := caddyfile.Segment{}
+		for i := range sb.block.Segments {
+			// replace user-defined placeholder shorthands in extracted named routes
+			replacer.ApplyToSegment(&sb.block.Segments[i])
+
+			// zip up all the segments since ParseSegmentAsSubroute
+			// was designed to take a directive+
+			wholeSegment = append(wholeSegment, sb.block.Segments[i]...)
+		}
+
+		h := Helper{
+			Dispenser:    caddyfile.NewDispenser(wholeSegment),
+			options:      options,
+			warnings:     warnings,
+			matcherDefs:  nil,
+			parentBlock:  sb.block,
+			groupCounter: gc,
+			State:        state,
+		}
+
+		handler, err := ParseSegmentAsSubroute(h)
+		if err != nil {
+			return nil, err
+		}
+		subroute := handler.(*caddyhttp.Subroute)
+		route := caddyhttp.Route{}
+
+		if len(subroute.Routes) == 1 && len(subroute.Routes[0].MatcherSetsRaw) == 0 {
+			// if there's only one route with no matcher, then we can simplify
+			route.HandlersRaw = append(route.HandlersRaw, subroute.Routes[0].HandlersRaw[0])
+		} else {
+			// otherwise we need the whole subroute
+			route.HandlersRaw = []json.RawMessage{caddyconfig.JSONModuleObject(handler, "handler", subroute.CaddyModule().ID.Name(), h.warnings)}
+		}
+
+		namedRoutes[sb.block.Keys[0]] = &route
+	}
+	options["named_routes"] = namedRoutes
+
+	return filtered, nil
+}
+
 // serversFromPairings creates the servers for each pairing of addresses
 // to server blocks. Each pairing is essentially a server definition.
 func (st *ServerType) serversFromPairings(
@@ -400,6 +501,7 @@ func (st *ServerType) serversFromPairings(
 ) (map[string]*caddyhttp.Server, error) {
 	servers := make(map[string]*caddyhttp.Server)
 	defaultSNI := tryString(options["default_sni"], warnings)
+	fallbackSNI := tryString(options["fallback_sni"], warnings)
 
 	httpPort := strconv.Itoa(caddyhttp.DefaultHTTPPort)
 	if hp, ok := options["http_port"].(int); ok {
@@ -528,6 +630,24 @@ func (st *ServerType) serversFromPairings(
 			}
 		}
 
+		// add named routes to the server if 'invoke' was used inside of it
+		configuredNamedRoutes := options["named_routes"].(map[string]*caddyhttp.Route)
+		for _, sblock := range p.serverBlocks {
+			if len(sblock.pile[namedRouteKey]) == 0 {
+				continue
+			}
+			for _, value := range sblock.pile[namedRouteKey] {
+				if srv.NamedRoutes == nil {
+					srv.NamedRoutes = map[string]*caddyhttp.Route{}
+				}
+				name := value.Value.(string)
+				if configuredNamedRoutes[name] == nil {
+					return nil, fmt.Errorf("cannot invoke named route '%s', which was not defined", name)
+				}
+				srv.NamedRoutes[name] = configuredNamedRoutes[name]
+			}
+		}
+
 		// create a subroute for each site in the server block
 		for _, sblock := range p.serverBlocks {
 			matcherSetsEnc, err := st.compileEncodedMatcherSets(sblock)
@@ -557,14 +677,21 @@ func (st *ServerType) serversFromPairings(
 							cp.DefaultSNI = defaultSNI
 							break
 						}
+						if h == fallbackSNI {
+							hosts = append(hosts, "")
+							cp.FallbackSNI = fallbackSNI
+							break
+						}
 					}
 
 					if len(hosts) > 0 {
+						slices.Sort(hosts) // for deterministic JSON output
 						cp.MatchersRaw = caddy.ModuleMap{
 							"sni": caddyconfig.JSON(hosts, warnings), // make sure to match all hosts, not just auto-HTTPS-qualified ones
 						}
 					} else {
 						cp.DefaultSNI = defaultSNI
+						cp.FallbackSNI = fallbackSNI
 					}
 
 					// only append this policy if it actually changes something
@@ -590,10 +717,20 @@ func (st *ServerType) serversFromPairings(
 					}
 				}
 
+				// If TLS is specified as directive, it will also result in 1 or more connection policy being created
+				// Thus, catch-all address with non-standard port, e.g. :8443, can have TLS enabled without
+				// specifying prefix "https://"
+				// Second part of the condition is to allow creating TLS conn policy even though `auto_https` has been disabled
+				// ensuring compatibility with behavior described in below link
+				// https://caddy.community/t/making-sense-of-auto-https-and-why-disabling-it-still-serves-https-instead-of-http/9761
+				createdTLSConnPolicies, ok := sblock.pile["tls.connection_policy"]
+				hasTLSEnabled := (ok && len(createdTLSConnPolicies) > 0) ||
+					(addr.Host != "" && srv.AutoHTTPS != nil && !sliceContains(srv.AutoHTTPS.Skip, addr.Host))
+
 				// we'll need to remember if the address qualifies for auto-HTTPS, so we
 				// can add a TLS conn policy if necessary
 				if addr.Scheme == "https" ||
-					(addr.Scheme != "http" && addr.Host != "" && addr.Port != httpPort) {
+					(addr.Scheme != "http" && addr.Port != httpPort && hasTLSEnabled) {
 					addressQualifiesForTLS = true
 				}
 				// predict whether auto-HTTPS will add the conn policy for us; if so, we
@@ -618,7 +755,7 @@ func (st *ServerType) serversFromPairings(
 
 			// set up each handler directive, making sure to honor directive order
 			dirRoutes := sblock.pile["route"]
-			siteSubroute, err := buildSubroute(dirRoutes, groupCounter)
+			siteSubroute, err := buildSubroute(dirRoutes, groupCounter, true)
 			if err != nil {
 				return nil, err
 			}
@@ -642,12 +779,20 @@ func (st *ServerType) serversFromPairings(
 			sblockLogHosts := sblock.hostsFromKeys(true)
 			for _, cval := range sblock.pile["custom_log"] {
 				ncl := cval.Value.(namedCustomLog)
-				if sblock.hasHostCatchAllKey() {
+				if sblock.hasHostCatchAllKey() && len(ncl.hostnames) == 0 {
 					// all requests for hosts not able to be listed should use
 					// this log because it's a catch-all-hosts server block
 					srv.Logs.DefaultLoggerName = ncl.name
+				} else if len(ncl.hostnames) > 0 {
+					// if the logger overrides the hostnames, map that to the logger name
+					for _, h := range ncl.hostnames {
+						if srv.Logs.LoggerNames == nil {
+							srv.Logs.LoggerNames = make(map[string]string)
+						}
+						srv.Logs.LoggerNames[h] = ncl.name
+					}
 				} else {
-					// map each host to the user's desired logger name
+					// otherwise, map each host to the logger name
 					for _, h := range sblockLogHosts {
 						if srv.Logs.LoggerNames == nil {
 							srv.Logs.LoggerNames = make(map[string]string)
@@ -690,8 +835,8 @@ func (st *ServerType) serversFromPairings(
 		// policy missing for any HTTPS-enabled hosts, if so, add it... maybe?
 		if addressQualifiesForTLS &&
 			!hasCatchAllTLSConnPolicy &&
-			(len(srv.TLSConnPolicies) > 0 || !autoHTTPSWillAddConnPolicy || defaultSNI != "") {
-			srv.TLSConnPolicies = append(srv.TLSConnPolicies, &caddytls.ConnectionPolicy{DefaultSNI: defaultSNI})
+			(len(srv.TLSConnPolicies) > 0 || !autoHTTPSWillAddConnPolicy || defaultSNI != "" || fallbackSNI != "") {
+			srv.TLSConnPolicies = append(srv.TLSConnPolicies, &caddytls.ConnectionPolicy{DefaultSNI: defaultSNI, FallbackSNI: fallbackSNI})
 		}
 
 		// tidy things up a bit
@@ -706,7 +851,7 @@ func (st *ServerType) serversFromPairings(
 
 	err := applyServerOptions(servers, options, warnings)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("applying global server options: %v", err)
 	}
 
 	return servers, nil
@@ -900,8 +1045,8 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 	subroute *caddyhttp.Subroute,
 	matcherSetsEnc []caddy.ModuleMap,
 	p sbAddrAssociation,
-	warnings *[]caddyconfig.Warning) caddyhttp.RouteList {
-
+	warnings *[]caddyconfig.Warning,
+) caddyhttp.RouteList {
 	// nothing to do if... there's nothing to do
 	if len(matcherSetsEnc) == 0 && len(subroute.Routes) == 0 && subroute.Errors == nil {
 		return routeList
@@ -959,14 +1104,16 @@ func appendSubrouteToRouteList(routeList caddyhttp.RouteList,
 
 // buildSubroute turns the config values, which are expected to be routes
 // into a clean and orderly subroute that has all the routes within it.
-func buildSubroute(routes []ConfigValue, groupCounter counter) (*caddyhttp.Subroute, error) {
-	for _, val := range routes {
-		if !directiveIsOrdered(val.directive) {
-			return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here", val.directive)
+func buildSubroute(routes []ConfigValue, groupCounter counter, needsSorting bool) (*caddyhttp.Subroute, error) {
+	if needsSorting {
+		for _, val := range routes {
+			if !directiveIsOrdered(val.directive) {
+				return nil, fmt.Errorf("directive '%s' is not an ordered HTTP handler, so it cannot be used here - try placing within a route block or using the order global option", val.directive)
+			}
 		}
-	}
 
-	sortRoutes(routes)
+		sortRoutes(routes)
+	}
 
 	subroute := new(caddyhttp.Subroute)
 
@@ -1288,36 +1435,6 @@ func encodeMatcherSet(matchers map[string]caddyhttp.RequestMatcher) (caddy.Modul
 	return msEncoded, nil
 }
 
-// placeholderShorthands returns a slice of old-new string pairs,
-// where the left of the pair is a placeholder shorthand that may
-// be used in the Caddyfile, and the right is the replacement.
-func placeholderShorthands() []string {
-	return []string{
-		"{dir}", "{http.request.uri.path.dir}",
-		"{file}", "{http.request.uri.path.file}",
-		"{host}", "{http.request.host}",
-		"{hostport}", "{http.request.hostport}",
-		"{port}", "{http.request.port}",
-		"{method}", "{http.request.method}",
-		"{path}", "{http.request.uri.path}",
-		"{query}", "{http.request.uri.query}",
-		"{remote}", "{http.request.remote}",
-		"{remote_host}", "{http.request.remote.host}",
-		"{remote_port}", "{http.request.remote.port}",
-		"{scheme}", "{http.request.scheme}",
-		"{uri}", "{http.request.uri}",
-		"{tls_cipher}", "{http.request.tls.cipher_suite}",
-		"{tls_version}", "{http.request.tls.version}",
-		"{tls_client_fingerprint}", "{http.request.tls.client.fingerprint}",
-		"{tls_client_issuer}", "{http.request.tls.client.issuer}",
-		"{tls_client_serial}", "{http.request.tls.client.serial}",
-		"{tls_client_subject}", "{http.request.tls.client.subject}",
-		"{tls_client_certificate_pem}", "{http.request.tls.client.certificate_pem}",
-		"{tls_client_certificate_der_base64}", "{http.request.tls.client.certificate_der_base64}",
-		"{upstream_hostport}", "{http.reverse_proxy.upstream.hostport}",
-	}
-}
-
 // WasReplacedPlaceholderShorthand checks if a token string was
 // likely a replaced shorthand of the known Caddyfile placeholder
 // replacement outputs. Useful to prevent some user-defined map
@@ -1433,8 +1550,9 @@ func (c counter) nextGroup() string {
 }
 
 type namedCustomLog struct {
-	name string
-	log  *caddy.CustomLog
+	name      string
+	hostnames []string
+	log       *caddy.CustomLog
 }
 
 // sbAddrAssociation is a mapping from a list of
@@ -1445,7 +1563,10 @@ type sbAddrAssociation struct {
 	serverBlocks []serverBlock
 }
 
-const matcherPrefix = "@"
+const (
+	matcherPrefix = "@"
+	namedRouteKey = "named_route"
+)
 
 // Interface guard
 var _ caddyfile.ServerType = (*ServerType)(nil)

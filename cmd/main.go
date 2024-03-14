@@ -17,6 +17,7 @@ package caddycmd
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -30,11 +31,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/certmagic"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
 )
 
 func init() {
@@ -62,6 +64,10 @@ func Main() {
 	}
 
 	if err := rootCmd.Execute(); err != nil {
+		var exitError *exitError
+		if errors.As(err, &exitError) {
+			os.Exit(exitError.ExitCode)
+		}
 		os.Exit(1)
 	}
 }
@@ -89,6 +95,10 @@ func handlePingbackConn(conn net.Conn, expect []byte) error {
 // and returns the resulting JSON config bytes along with
 // the name of the loaded config file (if any).
 func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
+	return loadConfigWithLogger(caddy.Log(), configFile, adapterName)
+}
+
+func loadConfigWithLogger(logger *zap.Logger, configFile, adapterName string) ([]byte, string, error) {
 	// specifying an adapter without a config file is ambiguous
 	if adapterName != "" && configFile == "" {
 		return nil, "", fmt.Errorf("cannot adapt config without config file (use --config)")
@@ -107,13 +117,14 @@ func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("reading config file: %v", err)
 		}
-		caddy.Log().Info("using provided configuration",
-			zap.String("config_file", configFile),
-			zap.String("config_adapter", adapterName))
+		if logger != nil {
+			logger.Info("using provided configuration",
+				zap.String("config_file", configFile),
+				zap.String("config_adapter", adapterName))
+		}
 	} else if adapterName == "" {
-		// as a special case when no config file or adapter
-		// is specified, see if the Caddyfile adapter is
-		// plugged in, and if so, try using a default Caddyfile
+		// if the Caddyfile adapter is plugged in, we can try using an
+		// adjacent Caddyfile by default
 		cfgAdapter = caddyconfig.GetAdapter("caddyfile")
 		if cfgAdapter != nil {
 			config, err = os.ReadFile("Caddyfile")
@@ -126,7 +137,9 @@ func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
 			} else {
 				// success reading default Caddyfile
 				configFile = "Caddyfile"
-				caddy.Log().Info("using adjacent Caddyfile")
+				if logger != nil {
+					logger.Info("using adjacent Caddyfile")
+				}
 			}
 		}
 	}
@@ -161,7 +174,9 @@ func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
 			if warn.Directive != "" {
 				msg = fmt.Sprintf("%s: %s", warn.Directive, warn.Message)
 			}
-			caddy.Log().Warn(msg, zap.String("adapter", adapterName), zap.String("file", warn.File), zap.Int("line", warn.Line))
+			if logger != nil {
+				logger.Warn(msg, zap.String("adapter", adapterName), zap.String("file", warn.File), zap.Int("line", warn.Line))
+			}
 		}
 		config = adaptedConfig
 	}
@@ -174,6 +189,8 @@ func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
 // blocks indefinitely; it only quits if the poller has errors for
 // long enough time. The filename passed in must be the actual
 // config file used, not one to be discovered.
+// Each second the config files is loaded and parsed into an object
+// and is compared to the last config object that was loaded
 func watchConfigFile(filename, adapterName string) {
 	defer func() {
 		if err := recover(); err != nil {
@@ -189,64 +206,36 @@ func watchConfigFile(filename, adapterName string) {
 			With(zap.String("config_file", filename))
 	}
 
-	// get the initial timestamp on the config file
-	info, err := os.Stat(filename)
+	// get current config
+	lastCfg, _, err := loadConfigWithLogger(nil, filename, adapterName)
 	if err != nil {
-		logger().Error("cannot watch config file", zap.Error(err))
+		logger().Error("unable to load latest config", zap.Error(err))
 		return
 	}
-	lastModified := info.ModTime()
 
 	logger().Info("watching config file for changes")
-
-	// if the file disappears or something, we can
-	// stop polling if the error lasts long enough
-	var lastErr time.Time
-	finalError := func(err error) bool {
-		if lastErr.IsZero() {
-			lastErr = time.Now()
-			return false
-		}
-		if time.Since(lastErr) > 30*time.Second {
-			logger().Error("giving up watching config file; too many errors",
-				zap.Error(err))
-			return true
-		}
-		return false
-	}
 
 	// begin poller
 	//nolint:staticcheck
 	for range time.Tick(1 * time.Second) {
-		// get the file info
-		info, err := os.Stat(filename)
-		if err != nil {
-			if finalError(err) {
-				return
-			}
-			continue
-		}
-		lastErr = time.Time{} // no error, so clear any memory of one
-
-		// if it hasn't changed, nothing to do
-		if !info.ModTime().After(lastModified) {
-			continue
-		}
-
-		logger().Info("config file changed; reloading")
-
-		// remember this timestamp
-		lastModified = info.ModTime()
-
-		// load the contents of the file
-		config, _, err := LoadConfig(filename, adapterName)
+		// get current config
+		newCfg, _, err := loadConfigWithLogger(nil, filename, adapterName)
 		if err != nil {
 			logger().Error("unable to load latest config", zap.Error(err))
-			continue
+			return
 		}
 
+		// if it hasn't changed, nothing to do
+		if bytes.Equal(lastCfg, newCfg) {
+			continue
+		}
+		logger().Info("config file changed; reloading")
+
+		// remember the current config
+		lastCfg = newCfg
+
 		// apply the updated config
-		err = caddy.Load(config, false)
+		err = caddy.Load(lastCfg, false)
 		if err != nil {
 			logger().Error("applying latest config", zap.Error(err))
 			continue
@@ -316,8 +305,12 @@ func loadEnvFromFile(envFile string) error {
 	}
 
 	for k, v := range envMap {
-		if err := os.Setenv(k, v); err != nil {
-			return fmt.Errorf("setting environment variables: %v", err)
+		// do not overwrite existing environment variables
+		_, exists := os.LookupEnv(k)
+		if !exists {
+			if err := os.Setenv(k, v); err != nil {
+				return fmt.Errorf("setting environment variables: %v", err)
+			}
 		}
 	}
 
@@ -374,18 +367,19 @@ func parseEnvFile(envInput io.Reader) (map[string]string, error) {
 		}
 
 		// quoted value: support newlines
-		if strings.HasPrefix(val, `"`) {
-			for !(strings.HasSuffix(line, `"`) && !strings.HasSuffix(line, `\"`)) {
-				val = strings.ReplaceAll(val, `\"`, `"`)
+		if strings.HasPrefix(val, `"`) || strings.HasPrefix(val, "'") {
+			quote := string(val[0])
+			for !(strings.HasSuffix(line, quote) && !strings.HasSuffix(line, `\`+quote)) {
+				val = strings.ReplaceAll(val, `\`+quote, quote)
 				if !scanner.Scan() {
 					break
 				}
 				lineNumber++
-				line = strings.ReplaceAll(scanner.Text(), `\"`, `"`)
+				line = strings.ReplaceAll(scanner.Text(), `\`+quote, quote)
 				val += "\n" + line
 			}
-			val = strings.TrimPrefix(val, `"`)
-			val = strings.TrimSuffix(val, `"`)
+			val = strings.TrimPrefix(val, quote)
+			val = strings.TrimSuffix(val, quote)
 		}
 
 		envMap[key] = val

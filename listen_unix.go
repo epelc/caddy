@@ -15,7 +15,8 @@
 // Even though the filename ends in _unix.go, we still have to specify the
 // build constraint here, because the filename convention only works for
 // literal GOOS values, and "unix" is a shortcut unique to build tags.
-//go:build unix && !solaris
+
+//go:build unix
 
 package caddy
 

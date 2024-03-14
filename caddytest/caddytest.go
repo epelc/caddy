@@ -22,9 +22,10 @@ import (
 	"time"
 
 	"github.com/aryann/difflib"
-	"github.com/caddyserver/caddy/v2/caddyconfig"
+
 	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 
+	"github.com/caddyserver/caddy/v2/caddyconfig"
 	// plug in Caddy modules here
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 )
@@ -63,7 +64,6 @@ type Tester struct {
 
 // NewTester will create a new testing client with an attached cookie jar
 func NewTester(t *testing.T) *Tester {
-
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatalf("failed to create cookiejar: %s", err)
@@ -94,7 +94,6 @@ func timeElapsed(start time.Time, name string) {
 // InitServer this will configure the server with a configurion of a specific
 // type. The configType must be either "json" or the adapter type.
 func (tc *Tester) InitServer(rawConfig string, configType string) {
-
 	if err := tc.initServer(rawConfig, configType); err != nil {
 		tc.t.Logf("failed to load config: %s", err)
 		tc.t.Fail()
@@ -108,13 +107,12 @@ func (tc *Tester) InitServer(rawConfig string, configType string) {
 // InitServer this will configure the server with a configurion of a specific
 // type. The configType must be either "json" or the adapter type.
 func (tc *Tester) initServer(rawConfig string, configType string) error {
-
 	if testing.Short() {
 		tc.t.SkipNow()
 		return nil
 	}
 
-	err := validateTestPrerequisites()
+	err := validateTestPrerequisites(tc.t)
 	if err != nil {
 		tc.t.Skipf("skipping tests as failed integration prerequisites. %s", err)
 		return nil
@@ -218,16 +216,20 @@ func (tc *Tester) ensureConfigRunning(rawConfig string, configType string) error
 		if reflect.DeepEqual(expected, fetchConfig(client)) {
 			return nil
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 	}
 	tc.t.Errorf("POSTed configuration isn't active")
 	return errors.New("EnsureConfigRunning: POSTed configuration isn't active")
 }
 
+const initConfig = `{
+	admin localhost:2999
+}
+`
+
 // validateTestPrerequisites ensures the certificates are available in the
 // designated path and Caddy sub-process is running.
-func validateTestPrerequisites() error {
-
+func validateTestPrerequisites(t *testing.T) error {
 	// check certificates are found
 	for _, certName := range Default.Certifcates {
 		if _, err := os.Stat(getIntegrationDir() + certName); os.IsNotExist(err) {
@@ -236,15 +238,27 @@ func validateTestPrerequisites() error {
 	}
 
 	if isCaddyAdminRunning() != nil {
+		// setup the init config file, and set the cleanup afterwards
+		f, err := os.CreateTemp("", "")
+		if err != nil {
+			return err
+		}
+		t.Cleanup(func() {
+			os.Remove(f.Name())
+		})
+		if _, err := f.WriteString(initConfig); err != nil {
+			return err
+		}
+
 		// start inprocess caddy server
-		os.Args = []string{"caddy", "run", "--config", "./test.init.config", "--adapter", "caddyfile"}
+		os.Args = []string{"caddy", "run", "--config", f.Name(), "--adapter", "caddyfile"}
 		go func() {
 			caddycmd.Main()
 		}()
 
 		// wait for caddy to start serving the initial config
 		for retries := 10; retries > 0 && isCaddyAdminRunning() != nil; retries-- {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(1 * time.Second)
 		}
 	}
 
@@ -267,7 +281,6 @@ func isCaddyAdminRunning() error {
 }
 
 func getIntegrationDir() string {
-
 	_, filename, _, ok := runtime.Caller(1)
 	if !ok {
 		panic("unable to determine the current file path")
@@ -287,7 +300,6 @@ func prependCaddyFilePath(rawConfig string) string {
 
 // CreateTestingTransport creates a testing transport that forces call dialing connections to happen locally
 func CreateTestingTransport() *http.Transport {
-
 	dialer := net.Dialer{
 		Timeout:   5 * time.Second,
 		KeepAlive: 5 * time.Second,
@@ -315,7 +327,6 @@ func CreateTestingTransport() *http.Transport {
 
 // AssertLoadError will load a config and expect an error
 func AssertLoadError(t *testing.T, rawConfig string, configType string, expectedError string) {
-
 	tc := NewTester(t)
 
 	err := tc.initServer(rawConfig, configType)
@@ -326,7 +337,6 @@ func AssertLoadError(t *testing.T, rawConfig string, configType string, expected
 
 // AssertRedirect makes a request and asserts the redirection happens
 func (tc *Tester) AssertRedirect(requestURI string, expectedToLocation string, expectedStatusCode int) *http.Response {
-
 	redirectPolicyFunc := func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -364,7 +374,6 @@ func (tc *Tester) AssertRedirect(requestURI string, expectedToLocation string, e
 
 // CompareAdapt adapts a config and then compares it against an expected result
 func CompareAdapt(t *testing.T, filename, rawConfig string, adapterName string, expectedResponse string) bool {
-
 	cfgAdapter := caddyconfig.GetAdapter(adapterName)
 	if cfgAdapter == nil {
 		t.Logf("unrecognized config adapter '%s'", adapterName)
@@ -452,14 +461,13 @@ func applyHeaders(t *testing.T, req *http.Request, requestHeaders []string) {
 
 // AssertResponseCode will execute the request and verify the status code, returns a response for additional assertions
 func (tc *Tester) AssertResponseCode(req *http.Request, expectedStatusCode int) *http.Response {
-
 	resp, err := tc.Client.Do(req)
 	if err != nil {
 		tc.t.Fatalf("failed to call server %s", err)
 	}
 
 	if expectedStatusCode != resp.StatusCode {
-		tc.t.Errorf("requesting \"%s\" expected status code: %d but got %d", req.RequestURI, expectedStatusCode, resp.StatusCode)
+		tc.t.Errorf("requesting \"%s\" expected status code: %d but got %d", req.URL.RequestURI(), expectedStatusCode, resp.StatusCode)
 	}
 
 	return resp
@@ -467,7 +475,6 @@ func (tc *Tester) AssertResponseCode(req *http.Request, expectedStatusCode int) 
 
 // AssertResponse request a URI and assert the status code and the body contains a string
 func (tc *Tester) AssertResponse(req *http.Request, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	resp := tc.AssertResponseCode(req, expectedStatusCode)
 
 	defer resp.Body.Close()
@@ -489,7 +496,6 @@ func (tc *Tester) AssertResponse(req *http.Request, expectedStatusCode int, expe
 
 // AssertGetResponse GET a URI and expect a statusCode and body text
 func (tc *Tester) AssertGetResponse(requestURI string, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	req, err := http.NewRequest("GET", requestURI, nil)
 	if err != nil {
 		tc.t.Fatalf("unable to create request %s", err)
@@ -500,7 +506,6 @@ func (tc *Tester) AssertGetResponse(requestURI string, expectedStatusCode int, e
 
 // AssertDeleteResponse request a URI and expect a statusCode and body text
 func (tc *Tester) AssertDeleteResponse(requestURI string, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	req, err := http.NewRequest("DELETE", requestURI, nil)
 	if err != nil {
 		tc.t.Fatalf("unable to create request %s", err)
@@ -511,7 +516,6 @@ func (tc *Tester) AssertDeleteResponse(requestURI string, expectedStatusCode int
 
 // AssertPostResponseBody POST to a URI and assert the response code and body
 func (tc *Tester) AssertPostResponseBody(requestURI string, requestHeaders []string, requestBody *bytes.Buffer, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	req, err := http.NewRequest("POST", requestURI, requestBody)
 	if err != nil {
 		tc.t.Errorf("failed to create request %s", err)
@@ -525,7 +529,6 @@ func (tc *Tester) AssertPostResponseBody(requestURI string, requestHeaders []str
 
 // AssertPutResponseBody PUT to a URI and assert the response code and body
 func (tc *Tester) AssertPutResponseBody(requestURI string, requestHeaders []string, requestBody *bytes.Buffer, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	req, err := http.NewRequest("PUT", requestURI, requestBody)
 	if err != nil {
 		tc.t.Errorf("failed to create request %s", err)
@@ -539,7 +542,6 @@ func (tc *Tester) AssertPutResponseBody(requestURI string, requestHeaders []stri
 
 // AssertPatchResponseBody PATCH to a URI and assert the response code and body
 func (tc *Tester) AssertPatchResponseBody(requestURI string, requestHeaders []string, requestBody *bytes.Buffer, expectedStatusCode int, expectedBody string) (*http.Response, string) {
-
 	req, err := http.NewRequest("PATCH", requestURI, requestBody)
 	if err != nil {
 		tc.t.Errorf("failed to create request %s", err)

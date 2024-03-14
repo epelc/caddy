@@ -25,10 +25,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyevents"
 )
 
 func init() {
@@ -36,12 +37,24 @@ func init() {
 	caddy.RegisterModule(AutomateLoader{})
 }
 
+var (
+	certCache   *certmagic.Cache
+	certCacheMu sync.RWMutex
+)
+
 // TLS provides TLS facilities including certificate
 // loading and management, client auth, and more.
 type TLS struct {
-	// Caches certificates in memory for quick use during
+	// Certificates to load into memory for quick recall during
 	// TLS handshakes. Each key is the name of a certificate
-	// loader module. All loaded certificates get pooled
+	// loader module.
+	//
+	// The "automate" certificate loader module can be used to
+	// specify a list of subjects that need certificates to be
+	// managed automatically. The first matching automation
+	// policy will be applied to manage the certificate(s).
+	//
+	// All loaded certificates get pooled
 	// into the same cache and may be used to complete TLS
 	// handshakes for the relevant server names (SNI).
 	// Certificates loaded manually (anything other than
@@ -70,12 +83,15 @@ type TLS struct {
 
 	certificateLoaders []CertificateLoader
 	automateNames      []string
-	certCache          *certmagic.Cache
 	ctx                caddy.Context
 	storageCleanTicker *time.Ticker
 	storageCleanStop   chan struct{}
 	logger             *zap.Logger
 	events             *caddyevents.App
+
+	// set of subjects with managed certificates,
+	// and hashes of manually-loaded certificates
+	managing, loaded map[string]struct{}
 }
 
 // CaddyModule returns the Caddy module information.
@@ -96,6 +112,7 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	t.ctx = ctx
 	t.logger = ctx.Logger()
 	repl := caddy.NewReplacer()
+	t.managing, t.loaded = make(map[string]struct{}), make(map[string]struct{})
 
 	// set up a new certificate cache; this (re)loads all certificates
 	cacheOpts := certmagic.CacheOptions{
@@ -114,7 +131,14 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	if cacheOpts.Capacity <= 0 {
 		cacheOpts.Capacity = 10000
 	}
-	t.certCache = certmagic.NewCache(cacheOpts)
+
+	certCacheMu.Lock()
+	if certCache == nil {
+		certCache = certmagic.NewCache(cacheOpts)
+	} else {
+		certCache.SetOptions(cacheOpts)
+	}
+	certCacheMu.Unlock()
 
 	// certificate loaders
 	val, err := ctx.LoadModule(t, "CertificatesRaw")
@@ -126,7 +150,12 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 			// special case; these will be loaded in later using our automation facilities,
 			// which we want to avoid doing during provisioning
 			if automateNames, ok := modIface.(*AutomateLoader); ok && automateNames != nil {
-				t.automateNames = []string(*automateNames)
+				repl := caddy.NewReplacer()
+				subjects := make([]string, len(*automateNames))
+				for i, sub := range *automateNames {
+					subjects[i] = repl.ReplaceAll(sub, "")
+				}
+				t.automateNames = subjects
 			} else {
 				return fmt.Errorf("loading certificates with 'automate' requires array of strings, got: %T", modIface)
 			}
@@ -181,8 +210,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		onDemandRateLimiter.SetWindow(time.Duration(t.Automation.OnDemand.RateLimit.Interval))
 	} else {
 		// remove any existing rate limiter
-		onDemandRateLimiter.SetMaxEvents(0)
 		onDemandRateLimiter.SetWindow(0)
+		onDemandRateLimiter.SetMaxEvents(0)
 	}
 
 	// run replacer on ask URL (for environment variables) -- return errors to prevent surprises (#5036)
@@ -197,7 +226,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 	// provision so that other apps (such as http) can know which
 	// certificates have been manually loaded, and also so that
 	// commands like validate can be a better test
-	magic := certmagic.New(t.certCache, certmagic.Config{
+	certCacheMu.RLock()
+	magic := certmagic.New(certCache, certmagic.Config{
 		Storage: ctx.Storage(),
 		Logger:  t.logger,
 		OnEvent: t.onEvent,
@@ -205,16 +235,18 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 			DisableStapling: t.DisableOCSPStapling,
 		},
 	})
+	certCacheMu.RUnlock()
 	for _, loader := range t.certificateLoaders {
 		certs, err := loader.LoadCertificates()
 		if err != nil {
 			return fmt.Errorf("loading certificates: %v", err)
 		}
 		for _, cert := range certs {
-			err := magic.CacheUnmanagedTLSCertificate(ctx, cert.Certificate, cert.Tags)
+			hash, err := magic.CacheUnmanagedTLSCertificate(ctx, cert.Certificate, cert.Tags)
 			if err != nil {
 				return fmt.Errorf("caching unmanaged certificate: %v", err)
 			}
+			t.loaded[hash] = struct{}{}
 		}
 	}
 
@@ -231,13 +263,13 @@ func (t *TLS) Validate() error {
 		var hasDefault bool
 		hostSet := make(map[string]int)
 		for i, ap := range t.Automation.Policies {
-			if len(ap.Subjects) == 0 {
+			if len(ap.subjects) == 0 {
 				if hasDefault {
 					return fmt.Errorf("automation policy %d is the second policy that acts as default/catch-all, but will never be used", i)
 				}
 				hasDefault = true
 			}
-			for _, h := range ap.Subjects {
+			for _, h := range ap.subjects {
 				if first, ok := hostSet[h]; ok {
 					return fmt.Errorf("automation policy %d: cannot apply more than one automation policy to host: %s (first match in policy %d)", i, h, first)
 				}
@@ -259,7 +291,7 @@ func (t *TLS) Start() error {
 	if t.Automation.OnDemand == nil ||
 		(t.Automation.OnDemand.Ask == "" && t.Automation.OnDemand.RateLimit == nil) {
 		for _, ap := range t.Automation.Policies {
-			if ap.OnDemand {
+			if ap.OnDemand && ap.isWildcardOrDefault() {
 				t.logger.Warn("YOUR SERVER MAY BE VULNERABLE TO ABUSE: on-demand TLS is enabled, but no protections are in place",
 					zap.String("docs", "https://caddyserver.com/docs/automatic-https#on-demand-tls"))
 				break
@@ -293,14 +325,42 @@ func (t *TLS) Stop() error {
 
 // Cleanup frees up resources allocated during Provision.
 func (t *TLS) Cleanup() error {
-	// stop the certificate cache
-	if t.certCache != nil {
-		t.certCache.Stop()
-	}
-
 	// stop the session ticket rotation goroutine
 	if t.SessionTickets != nil {
 		t.SessionTickets.stop()
+	}
+
+	// if a new TLS app was loaded, remove certificates from the cache that are no longer
+	// being managed or loaded by the new config; if there is no more TLS app running,
+	// then stop cert maintenance and let the cert cache be GC'ed
+	if nextTLS := caddy.ActiveContext().AppIfConfigured("tls"); nextTLS != nil {
+		nextTLSApp := nextTLS.(*TLS)
+
+		// compute which certificates were managed or loaded into the cert cache by this
+		// app instance (which is being stopped) that are not managed or loaded by the
+		// new app instance (which just started), and remove them from the cache
+		var noLongerManaged, noLongerLoaded []string
+		for subj := range t.managing {
+			if _, ok := nextTLSApp.managing[subj]; !ok {
+				noLongerManaged = append(noLongerManaged, subj)
+			}
+		}
+		for hash := range t.loaded {
+			if _, ok := nextTLSApp.loaded[hash]; !ok {
+				noLongerLoaded = append(noLongerLoaded, hash)
+			}
+		}
+
+		certCacheMu.RLock()
+		certCache.RemoveManaged(noLongerManaged)
+		certCache.Remove(noLongerLoaded)
+		certCacheMu.RUnlock()
+	} else {
+		// no more TLS app running, so delete in-memory cert cache
+		certCache.Stop()
+		certCacheMu.Lock()
+		certCache = nil
+		certCacheMu.Unlock()
 	}
 
 	return nil
@@ -326,6 +386,9 @@ func (t *TLS) Manage(names []string) error {
 		err := ap.magic.ManageAsync(t.ctx.Context, names)
 		if err != nil {
 			return fmt.Errorf("automate: manage %v: %v", names, err)
+		}
+		for _, name := range names {
+			t.managing[name] = struct{}{}
 		}
 	}
 
@@ -388,8 +451,8 @@ func (t *TLS) AddAutomationPolicy(ap *AutomationPolicy) error {
 		// first see if existing is superset of ap for all names
 		var otherIsSuperset bool
 	outer:
-		for _, thisSubj := range ap.Subjects {
-			for _, otherSubj := range existing.Subjects {
+		for _, thisSubj := range ap.subjects {
+			for _, otherSubj := range existing.subjects {
 				if certmagic.MatchWildcard(thisSubj, otherSubj) {
 					otherIsSuperset = true
 					break outer
@@ -398,7 +461,7 @@ func (t *TLS) AddAutomationPolicy(ap *AutomationPolicy) error {
 		}
 		// if existing AP is a superset or if it contains fewer names (i.e. is
 		// more general), then new AP is more specific, so insert before it
-		if otherIsSuperset || len(existing.Subjects) < len(ap.Subjects) {
+		if otherIsSuperset || len(existing.SubjectsRaw) < len(ap.SubjectsRaw) {
 			t.Automation.Policies = append(t.Automation.Policies[:i],
 				append([]*AutomationPolicy{ap}, t.Automation.Policies[i:]...)...)
 			return nil
@@ -420,10 +483,10 @@ func (t *TLS) getConfigForName(name string) *certmagic.Config {
 // public certificate or not.
 func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
 	for _, ap := range t.Automation.Policies {
-		if len(ap.Subjects) == 0 {
+		if len(ap.subjects) == 0 {
 			return ap // no host filter is an automatic match
 		}
-		for _, h := range ap.Subjects {
+		for _, h := range ap.subjects {
 			if certmagic.MatchWildcard(name, h) {
 				return ap
 			}
@@ -437,8 +500,27 @@ func (t *TLS) getAutomationPolicyForName(name string) *AutomationPolicy {
 
 // AllMatchingCertificates returns the list of all certificates in
 // the cache which could be used to satisfy the given SAN.
-func (t *TLS) AllMatchingCertificates(san string) []certmagic.Certificate {
-	return t.certCache.AllMatchingCertificates(san)
+func AllMatchingCertificates(san string) []certmagic.Certificate {
+	return certCache.AllMatchingCertificates(san)
+}
+
+func (t *TLS) HasCertificateForSubject(subject string) bool {
+	certCacheMu.RLock()
+	allMatchingCerts := certCache.AllMatchingCertificates(subject)
+	certCacheMu.RUnlock()
+	for _, cert := range allMatchingCerts {
+		// check if the cert is manually loaded by this config
+		if _, ok := t.loaded[cert.Hash()]; ok {
+			return true
+		}
+		// check if the cert is automatically managed by this config
+		for _, name := range cert.Names {
+			if _, ok := t.managing[name]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // keepStorageClean starts a goroutine that immediately cleans up all
@@ -552,7 +634,9 @@ type Certificate struct {
 //
 // Technically, this is a no-op certificate loader module that is treated as
 // a special case: it uses this app's automation features to load certificates
-// for the list of hostnames, rather than loading certificates manually.
+// for the list of hostnames, rather than loading certificates manually. But
+// the end result is the same: certificates for these subject names will be
+// loaded into the in-memory cache and may then be used.
 type AutomateLoader []string
 
 // CaddyModule returns the Caddy module information.

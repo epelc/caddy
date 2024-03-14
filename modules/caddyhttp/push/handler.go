@@ -19,10 +19,11 @@ import (
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -251,5 +252,6 @@ const pushedLink = "http.handlers.push.pushed_link"
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
-	_ caddyhttp.HTTPInterfaces    = (*linkPusher)(nil)
+	_ http.ResponseWriter         = (*linkPusher)(nil)
+	_ http.Pusher                 = (*linkPusher)(nil)
 )

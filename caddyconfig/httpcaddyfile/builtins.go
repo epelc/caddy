@@ -24,15 +24,17 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/caddyserver/certmagic"
+	"github.com/mholt/acmez/acme"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"github.com/caddyserver/certmagic"
-	"github.com/mholt/acmez/acme"
-	"go.uber.org/zap/zapcore"
 )
 
 func init() {
@@ -47,6 +49,7 @@ func init() {
 	RegisterHandlerDirective("route", parseRoute)
 	RegisterHandlerDirective("handle", parseHandle)
 	RegisterDirective("handle_errors", parseHandleErrors)
+	RegisterHandlerDirective("invoke", parseInvoke)
 	RegisterDirective("log", parseLog)
 	RegisterHandlerDirective("skip_log", parseSkipLog)
 }
@@ -75,16 +78,22 @@ func parseBind(h Helper) ([]ConfigValue, error) {
 //	        trusted_leaf_cert      <base64_der>
 //	        trusted_leaf_cert_file <filename>
 //	    }
-//	    alpn      <values...>
-//	    load      <paths...>
-//	    ca        <acme_ca_endpoint>
-//	    ca_root   <pem_file>
-//	    dns       <provider_name> [...]
+//	    alpn                          <values...>
+//	    load                          <paths...>
+//	    ca                            <acme_ca_endpoint>
+//	    ca_root                       <pem_file>
+//	    key_type                      [ed25519|p256|p384|rsa2048|rsa4096]
+//	    dns                           <provider_name> [...]
+//	    propagation_delay             <duration>
+//	    propagation_timeout           <duration>
+//	    resolvers                     <dns_servers...>
+//	    dns_ttl                       <duration>
+//	    dns_challenge_override_domain <domain>
 //	    on_demand
-//	    eab    <key_id> <mac_key>
-//	    issuer <module_name> [...]
-//	    get_certificate <module_name> [...]
-//	    insecure_secrets_log <log_file>
+//	    eab                           <key_id> <mac_key>
+//	    issuer                        <module_name> [...]
+//	    get_certificate               <module_name> [...]
+//	    insecure_secrets_log          <log_file>
 //	}
 func parseTLS(h Helper) ([]ConfigValue, error) {
 	cp := new(caddytls.ConnectionPolicy)
@@ -172,17 +181,17 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 			case "protocols":
 				args := h.RemainingArgs()
 				if len(args) == 0 {
-					return nil, h.SyntaxErr("one or two protocols")
+					return nil, h.Errf("protocols requires one or two arguments")
 				}
 				if len(args) > 0 {
 					if _, ok := caddytls.SupportedProtocols[args[0]]; !ok {
-						return nil, h.Errf("Wrong protocol name or protocol not supported: '%s'", args[0])
+						return nil, h.Errf("wrong protocol name or protocol not supported: '%s'", args[0])
 					}
 					cp.ProtocolMin = args[0]
 				}
 				if len(args) > 1 {
 					if _, ok := caddytls.SupportedProtocols[args[1]]; !ok {
-						return nil, h.Errf("Wrong protocol name or protocol not supported: '%s'", args[1])
+						return nil, h.Errf("wrong protocol name or protocol not supported: '%s'", args[1])
 					}
 					cp.ProtocolMax = args[1]
 				}
@@ -190,7 +199,7 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 			case "ciphers":
 				for h.NextArg() {
 					if !caddytls.CipherSuiteNameSupported(h.Val()) {
-						return nil, h.Errf("Wrong cipher suite name or cipher suite not supported: '%s'", h.Val())
+						return nil, h.Errf("wrong cipher suite name or cipher suite not supported: '%s'", h.Val())
 					}
 					cp.CipherSuites = append(cp.CipherSuites, h.Val())
 				}
@@ -362,6 +371,75 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
 				}
 				acmeIssuer.Challenges.DNS.Resolvers = args
+
+			case "propagation_delay":
+				arg := h.RemainingArgs()
+				if len(arg) != 1 {
+					return nil, h.ArgErr()
+				}
+				delayStr := arg[0]
+				delay, err := caddy.ParseDuration(delayStr)
+				if err != nil {
+					return nil, h.Errf("invalid propagation_delay duration %s: %v", delayStr, err)
+				}
+				if acmeIssuer == nil {
+					acmeIssuer = new(caddytls.ACMEIssuer)
+				}
+				if acmeIssuer.Challenges == nil {
+					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+				}
+				if acmeIssuer.Challenges.DNS == nil {
+					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
+				}
+				acmeIssuer.Challenges.DNS.PropagationDelay = caddy.Duration(delay)
+
+			case "propagation_timeout":
+				arg := h.RemainingArgs()
+				if len(arg) != 1 {
+					return nil, h.ArgErr()
+				}
+				timeoutStr := arg[0]
+				var timeout time.Duration
+				if timeoutStr == "-1" {
+					timeout = time.Duration(-1)
+				} else {
+					var err error
+					timeout, err = caddy.ParseDuration(timeoutStr)
+					if err != nil {
+						return nil, h.Errf("invalid propagation_timeout duration %s: %v", timeoutStr, err)
+					}
+				}
+				if acmeIssuer == nil {
+					acmeIssuer = new(caddytls.ACMEIssuer)
+				}
+				if acmeIssuer.Challenges == nil {
+					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+				}
+				if acmeIssuer.Challenges.DNS == nil {
+					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
+				}
+				acmeIssuer.Challenges.DNS.PropagationTimeout = caddy.Duration(timeout)
+
+			case "dns_ttl":
+				arg := h.RemainingArgs()
+				if len(arg) != 1 {
+					return nil, h.ArgErr()
+				}
+				ttlStr := arg[0]
+				ttl, err := caddy.ParseDuration(ttlStr)
+				if err != nil {
+					return nil, h.Errf("invalid dns_ttl duration %s: %v", ttlStr, err)
+				}
+				if acmeIssuer == nil {
+					acmeIssuer = new(caddytls.ACMEIssuer)
+				}
+				if acmeIssuer.Challenges == nil {
+					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+				}
+				if acmeIssuer.Challenges.DNS == nil {
+					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
+				}
+				acmeIssuer.Challenges.DNS.TTL = caddy.Duration(ttl)
 
 			case "dns_challenge_override_domain":
 				arg := h.RemainingArgs()
@@ -655,29 +733,20 @@ func parseError(h Helper) (caddyhttp.MiddlewareHandler, error) {
 
 // parseRoute parses the route directive.
 func parseRoute(h Helper) (caddyhttp.MiddlewareHandler, error) {
-	sr := new(caddyhttp.Subroute)
-
 	allResults, err := parseSegmentAsConfig(h)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, result := range allResults {
-		switch handler := result.Value.(type) {
-		case caddyhttp.Route:
-			sr.Routes = append(sr.Routes, handler)
-		case caddyhttp.Subroute:
-			// directives which return a literal subroute instead of a route
-			// means they intend to keep those handlers together without
-			// them being reordered; we're doing that anyway since we're in
-			// the route directive, so just append its handlers
-			sr.Routes = append(sr.Routes, handler.Routes...)
+		switch result.Value.(type) {
+		case caddyhttp.Route, caddyhttp.Subroute:
 		default:
 			return nil, h.Errf("%s directive returned something other than an HTTP route or subroute: %#v (only handler directives can be used in routes)", result.directive, result.Value)
 		}
 	}
 
-	return sr, nil
+	return buildSubroute(allResults, h.groupCounter, false)
 }
 
 func parseHandle(h Helper) (caddyhttp.MiddlewareHandler, error) {
@@ -697,9 +766,31 @@ func parseHandleErrors(h Helper) ([]ConfigValue, error) {
 	}, nil
 }
 
+// parseInvoke parses the invoke directive.
+func parseInvoke(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	h.Next() // consume directive
+	if !h.NextArg() {
+		return nil, h.ArgErr()
+	}
+	for h.Next() || h.NextBlock(0) {
+		return nil, h.ArgErr()
+	}
+
+	// remember that we're invoking this name
+	// to populate the server with these named routes
+	if h.State[namedRouteKey] == nil {
+		h.State[namedRouteKey] = map[string]struct{}{}
+	}
+	h.State[namedRouteKey].(map[string]struct{})[h.Val()] = struct{}{}
+
+	// return the handler
+	return &caddyhttp.Invoke{Name: h.Val()}, nil
+}
+
 // parseLog parses the log directive. Syntax:
 //
-//	log {
+//	log <logger_name> {
+//	    hostnames <hostnames...>
 //	    output <writer_module> ...
 //	    format <encoder_module> ...
 //	    level  <level>
@@ -720,11 +811,13 @@ func parseLogHelper(h Helper, globalLogNames map[string]struct{}) ([]ConfigValue
 	var configValues []ConfigValue
 	for h.Next() {
 		// Logic below expects that a name is always present when a
-		// global option is being parsed.
-		var globalLogName string
+		// global option is being parsed; or an optional override
+		// is supported for access logs.
+		var logName string
+
 		if parseAsGlobalOption {
 			if h.NextArg() {
-				globalLogName = h.Val()
+				logName = h.Val()
 
 				// Only a single argument is supported.
 				if h.NextArg() {
@@ -735,26 +828,47 @@ func parseLogHelper(h Helper, globalLogNames map[string]struct{}) ([]ConfigValue
 				// reference the default logger. See the
 				// setupNewDefault function in the logging
 				// package for where this is configured.
-				globalLogName = caddy.DefaultLoggerName
+				logName = caddy.DefaultLoggerName
 			}
 
 			// Verify this name is unused.
-			_, used := globalLogNames[globalLogName]
+			_, used := globalLogNames[logName]
 			if used {
-				return nil, h.Err("duplicate global log option for: " + globalLogName)
+				return nil, h.Err("duplicate global log option for: " + logName)
 			}
-			globalLogNames[globalLogName] = struct{}{}
+			globalLogNames[logName] = struct{}{}
 		} else {
-			// No arguments are supported for the server block log directive
+			// An optional override of the logger name can be provided;
+			// otherwise a default will be used, like "log0", "log1", etc.
 			if h.NextArg() {
-				return nil, h.ArgErr()
+				logName = h.Val()
+
+				// Only a single argument is supported.
+				if h.NextArg() {
+					return nil, h.ArgErr()
+				}
 			}
 		}
 
 		cl := new(caddy.CustomLog)
 
+		// allow overriding the current site block's hostnames for this logger;
+		// this is useful for setting up loggers per subdomain in a site block
+		// with a wildcard domain
+		customHostnames := []string{}
+
 		for h.NextBlock(0) {
 			switch h.Val() {
+			case "hostnames":
+				if parseAsGlobalOption {
+					return nil, h.Err("hostnames is not allowed in the log global options")
+				}
+				args := h.RemainingArgs()
+				if len(args) == 0 {
+					return nil, h.ArgErr()
+				}
+				customHostnames = append(customHostnames, args...)
+
 			case "output":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
@@ -813,18 +927,16 @@ func parseLogHelper(h Helper, globalLogNames map[string]struct{}) ([]ConfigValue
 				}
 
 			case "include":
-				// This configuration is only allowed in the global options
 				if !parseAsGlobalOption {
-					return nil, h.ArgErr()
+					return nil, h.Err("include is not allowed in the log directive")
 				}
 				for h.NextArg() {
 					cl.Include = append(cl.Include, h.Val())
 				}
 
 			case "exclude":
-				// This configuration is only allowed in the global options
 				if !parseAsGlobalOption {
-					return nil, h.ArgErr()
+					return nil, h.Err("exclude is not allowed in the log directive")
 				}
 				for h.NextArg() {
 					cl.Exclude = append(cl.Exclude, h.Val())
@@ -836,24 +948,34 @@ func parseLogHelper(h Helper, globalLogNames map[string]struct{}) ([]ConfigValue
 		}
 
 		var val namedCustomLog
+		val.hostnames = customHostnames
+
+		isEmptyConfig := reflect.DeepEqual(cl, new(caddy.CustomLog))
+
 		// Skip handling of empty logging configs
-		if !reflect.DeepEqual(cl, new(caddy.CustomLog)) {
-			if parseAsGlobalOption {
-				// Use indicated name for global log options
-				val.name = globalLogName
-				val.log = cl
-			} else {
+
+		if parseAsGlobalOption {
+			// Use indicated name for global log options
+			val.name = logName
+		} else {
+			if logName != "" {
+				val.name = logName
+			} else if !isEmptyConfig {
 				// Construct a log name for server log streams
 				logCounter, ok := h.State["logCounter"].(int)
 				if !ok {
 					logCounter = 0
 				}
 				val.name = fmt.Sprintf("log%d", logCounter)
-				cl.Include = []string{"http.log.access." + val.name}
-				val.log = cl
 				logCounter++
 				h.State["logCounter"] = logCounter
 			}
+			if val.name != "" {
+				cl.Include = []string{"http.log.access." + val.name}
+			}
+		}
+		if !isEmptyConfig {
+			val.log = cl
 		}
 		configValues = append(configValues, ConfigValue{
 			Class: "custom_log",

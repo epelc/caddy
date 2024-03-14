@@ -20,9 +20,11 @@
 package encode
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -91,6 +93,7 @@ func (enc *Encode) Provision(ctx caddy.Context) error {
 					"application/xhtml+xml*",
 					"application/atom+xml*",
 					"application/rss+xml*",
+					"application/wasm*",
 					"image/svg+xml*",
 				},
 			},
@@ -117,14 +120,20 @@ func (enc *Encode) Validate() error {
 	return nil
 }
 
+func isEncodeAllowed(h http.Header) bool {
+	return !strings.Contains(h.Get("Cache-Control"), "no-transform")
+}
+
 func (enc *Encode) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	for _, encName := range AcceptedEncodings(r, enc.Prefer) {
-		if _, ok := enc.writerPools[encName]; !ok {
-			continue // encoding not offered
+	if isEncodeAllowed(r.Header) {
+		for _, encName := range AcceptedEncodings(r, enc.Prefer) {
+			if _, ok := enc.writerPools[encName]; !ok {
+				continue // encoding not offered
+			}
+			w = enc.openResponseWriter(encName, w)
+			defer w.(*responseWriter).Close()
+			break
 		}
-		w = enc.openResponseWriter(encName, w)
-		defer w.(*responseWriter).Close()
-		break
 	}
 	return next.ServeHTTP(w, r)
 }
@@ -159,10 +168,10 @@ func (enc *Encode) openResponseWriter(encodingName string, w http.ResponseWriter
 // initResponseWriter initializes the responseWriter instance
 // allocated in openResponseWriter, enabling mid-stack inlining.
 func (enc *Encode) initResponseWriter(rw *responseWriter, encodingName string, wrappedRW http.ResponseWriter) *responseWriter {
-	if httpInterfaces, ok := wrappedRW.(caddyhttp.HTTPInterfaces); ok {
-		rw.HTTPInterfaces = httpInterfaces
+	if rww, ok := wrappedRW.(*caddyhttp.ResponseWriterWrapper); ok {
+		rw.ResponseWriter = rww
 	} else {
-		rw.HTTPInterfaces = &caddyhttp.ResponseWriterWrapper{ResponseWriter: wrappedRW}
+		rw.ResponseWriter = &caddyhttp.ResponseWriterWrapper{ResponseWriter: wrappedRW}
 	}
 	rw.encodingName = encodingName
 	rw.config = enc
@@ -174,7 +183,7 @@ func (enc *Encode) initResponseWriter(rw *responseWriter, encodingName string, w
 // using the encoding represented by encodingName and
 // configured by config.
 type responseWriter struct {
-	caddyhttp.HTTPInterfaces
+	http.ResponseWriter
 	encodingName string
 	w            Encoder
 	config       *Encode
@@ -203,7 +212,21 @@ func (rw *responseWriter) Flush() {
 		// to rw.Write (see bug in #4314)
 		return
 	}
-	rw.HTTPInterfaces.Flush()
+	//nolint:bodyclose
+	http.NewResponseController(rw.ResponseWriter).Flush()
+}
+
+// Hijack implements http.Hijacker. It will flush status code if set. We don't track actual hijacked
+// status assuming http middlewares will track its status.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if !rw.wroteHeader {
+		if rw.statusCode != 0 {
+			rw.ResponseWriter.WriteHeader(rw.statusCode)
+		}
+		rw.wroteHeader = true
+	}
+	//nolint:bodyclose
+	return http.NewResponseController(rw.ResponseWriter).Hijack()
 }
 
 // Write writes to the response. If the response qualifies,
@@ -240,7 +263,7 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 	// by the standard library
 	if !rw.wroteHeader {
 		if rw.statusCode != 0 {
-			rw.HTTPInterfaces.WriteHeader(rw.statusCode)
+			rw.ResponseWriter.WriteHeader(rw.statusCode)
 		}
 		rw.wroteHeader = true
 	}
@@ -248,7 +271,7 @@ func (rw *responseWriter) Write(p []byte) (int, error) {
 	if rw.w != nil {
 		return rw.w.Write(p)
 	} else {
-		return rw.HTTPInterfaces.Write(p)
+		return rw.ResponseWriter.Write(p)
 	}
 }
 
@@ -264,7 +287,7 @@ func (rw *responseWriter) Close() error {
 
 		// issue #5059, don't write status code if not set explicitly.
 		if rw.statusCode != 0 {
-			rw.HTTPInterfaces.WriteHeader(rw.statusCode)
+			rw.ResponseWriter.WriteHeader(rw.statusCode)
 		}
 		rw.wroteHeader = true
 	}
@@ -279,13 +302,18 @@ func (rw *responseWriter) Close() error {
 	return err
 }
 
+// Unwrap returns the underlying ResponseWriter.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 // init should be called before we write a response, if rw.buf has contents.
 func (rw *responseWriter) init() {
-	if rw.Header().Get("Content-Encoding") == "" &&
+	if rw.Header().Get("Content-Encoding") == "" && isEncodeAllowed(rw.Header()) &&
 		rw.config.Match(rw) {
 
 		rw.w = rw.config.writerPools[rw.encodingName].Get().(Encoder)
-		rw.w.Reset(rw.HTTPInterfaces)
+		rw.w.Reset(rw.ResponseWriter)
 		rw.Header().Del("Content-Length") // https://github.com/golang/go/issues/14975
 		rw.Header().Set("Content-Encoding", rw.encodingName)
 		rw.Header().Add("Vary", "Accept-Encoding")
@@ -404,5 +432,4 @@ var (
 	_ caddy.Provisioner           = (*Encode)(nil)
 	_ caddy.Validator             = (*Encode)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Encode)(nil)
-	_ caddyhttp.HTTPInterfaces    = (*responseWriter)(nil)
 )

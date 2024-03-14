@@ -29,18 +29,25 @@ import (
 	"sync"
 	"text/template"
 
+	"go.uber.org/zap"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/templates"
-	"go.uber.org/zap"
 )
 
+// BrowseTemplate is the default template document to use for
+// file listings. By default, its default value is an embedded
+// document. You can override this value at program start, or
+// if you are running Caddy via config, you can specify a
+// custom template_file in the browse configuration.
+//
 //go:embed browse.html
-var defaultBrowseTemplate string
+var BrowseTemplate string
 
 // Browse configures directory browsing.
 type Browse struct {
-	// Use this template file instead of the default browse template.
+	// Filename of the template to use instead of the embedded browse template.
 	TemplateFile string `json:"template_file,omitempty"`
 }
 
@@ -82,8 +89,8 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	// calling path.Clean here prevents weird breadcrumbs when URL paths are sketchy like /%2e%2e%2f
-	listing, err := fsrv.loadDirectoryContents(r.Context(), dir.(fs.ReadDirFile), root, path.Clean(r.URL.Path), repl)
+	// TODO: not entirely sure if path.Clean() is necessary here but seems like a safe plan (i.e. /%2e%2e%2f) - someone could verify this
+	listing, err := fsrv.loadDirectoryContents(r.Context(), dir.(fs.ReadDirFile), root, path.Clean(r.URL.EscapedPath()), repl)
 	switch {
 	case os.IsPermission(err):
 		return caddyhttp.Error(http.StatusForbidden, err)
@@ -93,7 +100,7 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
-	fsrv.browseApplyQueryParams(w, r, &listing)
+	fsrv.browseApplyQueryParams(w, r, listing)
 
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -113,7 +120,7 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 			fs = http.Dir(repl.ReplaceAll(fsrv.Root, "."))
 		}
 
-		var tplCtx = &templateContext{
+		tplCtx := &templateContext{
 			TemplateContext: templates.TemplateContext{
 				Root:       fs,
 				Req:        r,
@@ -137,10 +144,10 @@ func (fsrv *FileServer) serveBrowse(root, dirPath string, w http.ResponseWriter,
 	return nil
 }
 
-func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, dir fs.ReadDirFile, root, urlPath string, repl *caddy.Replacer) (browseTemplateContext, error) {
+func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, dir fs.ReadDirFile, root, urlPath string, repl *caddy.Replacer) (*browseTemplateContext, error) {
 	files, err := dir.ReadDir(10000) // TODO: this limit should probably be configurable
 	if err != nil && err != io.EOF {
-		return browseTemplateContext{}, err
+		return nil, err
 	}
 
 	// user can presumably browse "up" to parent folder if path is longer than "/"
@@ -152,12 +159,20 @@ func (fsrv *FileServer) loadDirectoryContents(ctx context.Context, dir fs.ReadDi
 // browseApplyQueryParams applies query parameters to the listing.
 // It mutates the listing and may set cookies.
 func (fsrv *FileServer) browseApplyQueryParams(w http.ResponseWriter, r *http.Request, listing *browseTemplateContext) {
+	layoutParam := r.URL.Query().Get("layout")
 	sortParam := r.URL.Query().Get("sort")
 	orderParam := r.URL.Query().Get("order")
 	limitParam := r.URL.Query().Get("limit")
 	offsetParam := r.URL.Query().Get("offset")
 
-	// first figure out what to sort by
+	switch layoutParam {
+	case "list", "grid", "":
+		listing.Layout = layoutParam
+	default:
+		listing.Layout = "list"
+	}
+
+	// figure out what to sort by
 	switch sortParam {
 	case "":
 		sortParam = sortByNameDirFirst
@@ -196,7 +211,7 @@ func (fsrv *FileServer) makeBrowseTemplate(tplCtx *templateContext) (*template.T
 		}
 	} else {
 		tpl = tplCtx.NewTemplate("default_listing")
-		tpl, err = tpl.Parse(defaultBrowseTemplate)
+		tpl, err = tpl.Parse(BrowseTemplate)
 		if err != nil {
 			return nil, fmt.Errorf("parsing default browse template: %v", err)
 		}
@@ -229,7 +244,7 @@ func isSymlink(f fs.FileInfo) bool {
 // features.
 type templateContext struct {
 	templates.TemplateContext
-	browseTemplateContext
+	*browseTemplateContext
 }
 
 // bufPool is used to increase the efficiency of file listings.

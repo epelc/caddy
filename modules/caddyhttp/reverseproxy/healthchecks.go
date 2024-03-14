@@ -24,12 +24,12 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strconv"
-	"strings"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 // HealthChecks configures active and passive health checks.
@@ -46,10 +46,10 @@ type HealthChecks struct {
 
 	// Passive health checks monitor proxied requests for errors or timeouts.
 	// To minimally enable passive health checks, specify at least an empty
-	// config object. Passive health check state is shared (stored globally),
-	// so a failure from one handler will be counted by all handlers; but
-	// the tolerances or standards for what defines healthy/unhealthy backends
-	// is configured per-proxy-handler.
+	// config object with fail_duration > 0. Passive health check state is
+	// shared (stored globally), so a failure from one handler will be counted
+	// by all handlers; but the tolerances or standards for what defines
+	// healthy/unhealthy backends is configured per-proxy-handler.
 	//
 	// Passive health checks technically do operate on dynamic upstreams,
 	// but are only effective for very busy proxies where the list of
@@ -104,6 +104,76 @@ type ActiveHealthChecks struct {
 	httpClient *http.Client
 	bodyRegexp *regexp.Regexp
 	logger     *zap.Logger
+}
+
+// Provision ensures that a is set up properly before use.
+func (a *ActiveHealthChecks) Provision(ctx caddy.Context, h *Handler) error {
+	if !a.IsEnabled() {
+		return nil
+	}
+
+	// Canonicalize the header keys ahead of time, since
+	// JSON unmarshaled headers may be incorrect
+	cleaned := http.Header{}
+	for key, hdrs := range a.Headers {
+		for _, val := range hdrs {
+			cleaned.Add(key, val)
+		}
+	}
+	a.Headers = cleaned
+
+	h.HealthChecks.Active.logger = h.logger.Named("health_checker.active")
+
+	timeout := time.Duration(a.Timeout)
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+
+	if a.Path != "" {
+		a.logger.Warn("the 'path' option is deprecated, please use 'uri' instead!")
+	}
+
+	// parse the URI string (supports path and query)
+	if a.URI != "" {
+		parsedURI, err := url.Parse(a.URI)
+		if err != nil {
+			return err
+		}
+		a.uri = parsedURI
+	}
+
+	a.httpClient = &http.Client{
+		Timeout:   timeout,
+		Transport: h.Transport,
+	}
+
+	for _, upstream := range h.Upstreams {
+		// if there's an alternative port for health-check provided in the config,
+		// then use it, otherwise use the port of upstream.
+		if a.Port != 0 {
+			upstream.activeHealthCheckPort = a.Port
+		}
+	}
+
+	if a.Interval == 0 {
+		a.Interval = caddy.Duration(30 * time.Second)
+	}
+
+	if a.ExpectBody != "" {
+		var err error
+		a.bodyRegexp, err = regexp.Compile(a.ExpectBody)
+		if err != nil {
+			return fmt.Errorf("expect_body: compiling regular expression: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// IsEnabled checks if the active health checks have
+// the minimum config necessary to be enabled.
+func (a *ActiveHealthChecks) IsEnabled() bool {
+	return a.Path != "" || a.URI != "" || a.Port != 0
 }
 
 // PassiveHealthChecks holds configuration related to passive
@@ -203,7 +273,7 @@ func (h *Handler) doActiveHealthCheckForAllHosts() {
 				}
 				addr.StartPort, addr.EndPort = hcp, hcp
 			}
-			if upstream.LookupSRV == "" && addr.PortRangeSize() != 1 {
+			if addr.PortRangeSize() != 1 {
 				h.HealthChecks.Active.logger.Error("multiple addresses (upstream must map to only one address)",
 					zap.String("address", networkAddr),
 				)
@@ -237,14 +307,33 @@ func (h *Handler) doActiveHealthCheckForAllHosts() {
 // the host's health status fails.
 func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, upstream *Upstream) error {
 	// create the URL for the request that acts as a health check
-	scheme := "http"
-	if ht, ok := h.Transport.(TLSTransport); ok && ht.TLSEnabled() {
-		// this is kind of a hacky way to know if we should use HTTPS, but whatever
-		scheme = "https"
-	}
 	u := &url.URL{
-		Scheme: scheme,
+		Scheme: "http",
 		Host:   hostAddr,
+	}
+
+	// split the host and port if possible, override the port if configured
+	host, port, err := net.SplitHostPort(hostAddr)
+	if err != nil {
+		host = hostAddr
+	}
+	if h.HealthChecks.Active.Port != 0 {
+		port := strconv.Itoa(h.HealthChecks.Active.Port)
+		u.Host = net.JoinHostPort(host, port)
+	}
+
+	// this is kind of a hacky way to know if we should use HTTPS, but whatever
+	if tt, ok := h.Transport.(TLSTransport); ok && tt.TLSEnabled() {
+		u.Scheme = "https"
+
+		// if the port is in the except list, flip back to HTTP
+		if ht, ok := h.Transport.(*HTTPTransport); ok {
+			for _, exceptPort := range ht.TLS.ExceptPorts {
+				if exceptPort == port {
+					u.Scheme = "http"
+				}
+			}
+		}
 	}
 
 	// if we have a provisioned uri, use that, otherwise use
@@ -256,17 +345,8 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, upstre
 		u.Path = h.HealthChecks.Active.Path
 	}
 
-	// adjust the port, if configured to be different
-	if h.HealthChecks.Active.Port != 0 {
-		portStr := strconv.Itoa(h.HealthChecks.Active.Port)
-		host, _, err := net.SplitHostPort(hostAddr)
-		if err != nil {
-			host = hostAddr
-		}
-		u.Host = net.JoinHostPort(host, portStr)
-	}
-
-	// attach dialing information to this request
+	// attach dialing information to this request, as well as context values that
+	// may be expected by handlers of this request
 	ctx := h.ctx.Context
 	ctx = context.WithValue(ctx, caddy.ReplacerCtxKey, caddy.NewReplacer())
 	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, map[string]any{
@@ -276,11 +356,19 @@ func (h *Handler) doActiveHealthCheck(dialInfo DialInfo, hostAddr string, upstre
 	if err != nil {
 		return fmt.Errorf("making request: %v", err)
 	}
-	for key, hdrs := range h.HealthChecks.Active.Headers {
-		if strings.ToLower(key) == "host" {
-			req.Host = h.HealthChecks.Active.Headers.Get(key)
-		} else {
-			req.Header[key] = hdrs
+	ctx = context.WithValue(ctx, caddyhttp.OriginalRequestCtxKey, *req)
+	req = req.WithContext(ctx)
+
+	// set headers, using a replacer with only globals (env vars, system info, etc.)
+	repl := caddy.NewReplacer()
+	for key, vals := range h.HealthChecks.Active.Headers {
+		key = repl.ReplaceAll(key, "")
+		if key == "Host" {
+			req.Host = repl.ReplaceAll(h.HealthChecks.Active.Headers.Get(key), "")
+			continue
+		}
+		for _, val := range vals {
+			req.Header.Add(key, repl.ReplaceKnown(val, ""))
 		}
 	}
 

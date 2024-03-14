@@ -25,8 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common"
 	"github.com/google/cel-go/common/operators"
@@ -39,6 +37,9 @@ import (
 	"github.com/google/cel-go/parser"
 	"go.uber.org/zap"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
 func init() {
@@ -124,7 +125,7 @@ func (m *MatchExpression) Provision(ctx caddy.Context) error {
 
 	// create the CEL environment
 	env, err := cel.NewEnv(
-		cel.Function(placeholderFuncName, cel.SingletonBinaryImpl(m.caddyPlaceholderFunc), cel.Overload(
+		cel.Function(placeholderFuncName, cel.SingletonBinaryBinding(m.caddyPlaceholderFunc), cel.Overload(
 			placeholderFuncName+"_httpRequest_string",
 			[]*cel.Type{httpRequestObjectType, cel.StringType},
 			cel.AnyType,
@@ -191,15 +192,17 @@ func (m MatchExpression) caddyPlaceholderFunc(lhs, rhs ref.Val) ref.Val {
 	celReq, ok := lhs.(celHTTPRequest)
 	if !ok {
 		return types.NewErr(
-			"invalid request of type '%v' to "+placeholderFuncName+"(request, placeholderVarName)",
+			"invalid request of type '%v' to %s(request, placeholderVarName)",
 			lhs.Type(),
+			placeholderFuncName,
 		)
 	}
 	phStr, ok := rhs.(types.String)
 	if !ok {
 		return types.NewErr(
-			"invalid placeholder variable name of type '%v' to "+placeholderFuncName+"(request, placeholderVarName)",
+			"invalid placeholder variable name of type '%v' to %s(request, placeholderVarName)",
 			rhs.Type(),
+			placeholderFuncName,
 		)
 	}
 
@@ -232,9 +235,11 @@ func (cr celHTTPRequest) Parent() interpreter.Activation {
 func (cr celHTTPRequest) ConvertToNative(typeDesc reflect.Type) (any, error) {
 	return cr.Request, nil
 }
+
 func (celHTTPRequest) ConvertToType(typeVal ref.Type) ref.Val {
 	panic("not implemented")
 }
+
 func (cr celHTTPRequest) Equal(other ref.Val) ref.Val {
 	if o, ok := other.Value().(celHTTPRequest); ok {
 		return types.Bool(o.Request == cr.Request)
@@ -253,9 +258,14 @@ type celPkixName struct{ *pkix.Name }
 func (pn celPkixName) ConvertToNative(typeDesc reflect.Type) (any, error) {
 	return pn.Name, nil
 }
-func (celPkixName) ConvertToType(typeVal ref.Type) ref.Val {
+
+func (pn celPkixName) ConvertToType(typeVal ref.Type) ref.Val {
+	if typeVal.TypeName() == "string" {
+		return types.String(pn.Name.String())
+	}
 	panic("not implemented")
 }
+
 func (pn celPkixName) Equal(other ref.Val) ref.Val {
 	if o, ok := other.Value().(string); ok {
 		return types.Bool(pn.Name.String() == o)
@@ -345,7 +355,7 @@ func CELMatcherImpl(macroName, funcName string, matcherDataTypes []*cel.Type, fa
 		cel.Macros(macro),
 		cel.Function(funcName,
 			cel.Overload(funcName, append([]*cel.Type{requestType}, matcherDataTypes...), cel.BoolType),
-			cel.SingletonBinaryImpl(CELMatcherRuntimeFunction(funcName, fac))),
+			cel.SingletonBinaryBinding(CELMatcherRuntimeFunction(funcName, fac))),
 	}
 	programOptions := []cel.ProgramOption{
 		cel.CustomDecorator(CELMatcherDecorator(funcName, fac)),
@@ -491,7 +501,7 @@ func celMatcherStringMacroExpander(funcName string) parser.MacroExpander {
 	}
 }
 
-// celMatcherStringMacroExpander validates that the macro is called a single
+// celMatcherJSONMacroExpander validates that the macro is called a single
 // map literal argument.
 //
 // The following function call is returned: <funcName>(request, arg)
